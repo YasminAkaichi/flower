@@ -17,12 +17,14 @@
 
 from functools import reduce
 from typing import Any, Callable, List, Tuple
-
+import torch 
 import numpy as np
-
+import flwr.common.ilphelper as helper
+from andante.collections import OrderedSet
 from flwr.common import FitRes, NDArray, NDArrays, parameters_to_ndarrays
 from flwr.server.client_proxy import ClientProxy
-
+from flwr.common.logger import log
+from logging import INFO, WARN
 
 def aggregate(results: List[Tuple[NDArrays, int]]) -> NDArrays:
     """Compute weighted average."""
@@ -40,6 +42,30 @@ def aggregate(results: List[Tuple[NDArrays, int]]) -> NDArrays:
         for layer_updates in zip(*weighted_weights)
     ]
     return weights_prime
+
+def aggregate_fedilp(results: List[Tuple[NDArrays, int]]) -> NDArrays:
+    log(INFO, "Aggregate results from federated ILP.")
+    # step 1 convert list of ndarrays to tensors 
+    tensors = [torch.tensor(result[0]) for result in results]
+    # step 2 convert tensors to text 
+    texts = [helper.tensor_to_text(tensor) for tensor in tensors]
+    # step 3 convert text to OrderedSet 
+    ordered_sets= [OrderedSet.text_to_ordered_set(text) for text in texts]
+    # step 4 do the union to rules 
+    union_set = OrderedSet()
+    for ordered_set in ordered_sets:
+        union_set |= ordered_set
+    # step5: convert orderedset to text then to tensors then to ndarray 
+    log(INFO, "Requesting initial parameters from one random client", union_set)
+    text_union = OrderedSet.__str__(union_set)
+    #step6: convert text back to tensors
+    tensor_union = helper.text_to_tensor(text_union)
+    #step7: convert tensors back to ndarrays but before to parameters
+    tensor_parameters = helper.tensor_to_parameters(tensor_union)
+    ndarrays = parameters_to_ndarrays(tensor_parameters)
+    # return the ndarray send back 
+    return ndarrays
+
 
 
 def aggregate_inplace(results: List[Tuple[ClientProxy, FitRes]]) -> NDArrays:
