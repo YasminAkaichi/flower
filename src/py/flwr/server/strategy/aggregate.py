@@ -50,7 +50,7 @@ def aggregate_fedilp(results: List[Tuple[NDArrays, int]]) -> NDArrays:
     # step 2 convert tensors to text 
     texts = [helper.tensor_to_text(tensor) for tensor in tensors]
     # step 3 convert text to OrderedSet 
-    ordered_sets= [OrderedSet.text_to_ordered_set(text) for text in texts]
+    ordered_sets= [helper.text_to_ordered_set(text) for text in texts]
     # step 4 do the union to rules 
     union_set = OrderedSet()
     for ordered_set in ordered_sets:
