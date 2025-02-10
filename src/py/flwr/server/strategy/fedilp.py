@@ -96,7 +96,7 @@ class FedILP(Strategy):
             (parameters_to_ndarrays(fit_res.parameters), fit_res.num_examples)
             for _, fit_res in results
         ]
-        parameters_aggregated = ndarrays_to_parameters(aggregate_fedilp(weights_results))
+        parameters_aggregated = ndarrays_to_parameters(aggregate_ilp(weights_results))
         # Aggregate custom metrics if aggregation fn was provided
         metrics_aggregated = {}
         if self.fit_metrics_aggregation_fn:
