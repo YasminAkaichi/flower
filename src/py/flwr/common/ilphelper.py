@@ -26,6 +26,23 @@ from andante.solver import AndanteSolver
 from andante.parser import Parser
 from andante.collections import OrderedSet
 
+def serialize_ordered_set(ordered_set: OrderedSet) -> bytes:
+    """Serialize OrderedSet to bytes."""
+    return pickle.dumps(ordered_set)
+
+def deserialize_ordered_set(serialized: bytes) -> OrderedSet:
+    """Deserialize bytes back to OrderedSet."""
+    return pickle.loads(serialized)
+
+def ordered_set_to_ndarray(ordered_set: OrderedSet) -> np.ndarray:
+    """Convert OrderedSet to NumPy array."""
+    return np.array(list(ordered_set))
+
+def ndarray_to_ordered_set(array: np.ndarray) -> OrderedSet:
+    """Convert NumPy array back to OrderedSet."""
+    return OrderedSet(array.tolist())
+
+
 def text_to_tensor(rules: str|OrderedSet) -> torch.Tensor:
     """Convert a text or an OrderedSet to PyTorch tensor."""
     if isinstance(rules,str):
