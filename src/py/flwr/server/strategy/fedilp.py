@@ -16,7 +16,7 @@ from flwr.common import (
 from dataclasses import dataclass
 from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
-from flwr.server.strategy.aggregate import aggregate, weighted_loss_avg, aggregate_fedilp
+from flwr.server.strategy.aggregate import aggregate, weighted_loss_avg, aggregate_ilp
 from .strategy import Strategy
 from collections import OrderedDict
 from andante.program import AndanteProgram 
