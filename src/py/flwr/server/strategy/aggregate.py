@@ -43,6 +43,19 @@ def aggregate(results: List[Tuple[NDArrays, int]]) -> NDArrays:
     ]
     return weights_prime
 
+
+def aggregate_ilp(results: List[Tuple[np.ndarray, int]]) -> np.ndarray:
+    """Aggregate rules using union."""
+    aggregated_rules = OrderedSet()
+
+    for serialized_rules, _ in results:
+        # Deserialize and merge rules
+        local_rules = helper.deserialize_ordered_set(serialized_rules)
+        aggregated_rules |= local_rules
+
+    # Serialize back to NumPy array
+    return helper.ordered_set_to_ndarray(aggregated_rules)
+
 def aggregate_fedilp(results: List[Tuple[NDArrays, int]]) -> NDArrays:
     log(INFO, "Aggregate results from federated ILP.")
     # step 1 convert list of ndarrays to tensors 
