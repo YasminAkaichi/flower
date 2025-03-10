@@ -19,12 +19,261 @@ from functools import reduce
 from typing import Any, Callable, List, Tuple
 import torch 
 import numpy as np
-import flwr.common.ilphelper as helper
-from andante.collections import OrderedSet
 from flwr.common import FitRes, NDArray, NDArrays, parameters_to_ndarrays
 from flwr.server.client_proxy import ClientProxy
 from flwr.common.logger import log
 from logging import INFO, WARN
+from typing import List, Tuple
+from functools import reduce
+from flwr.common import NDArrays
+from typing import List, Tuple
+from popper.asp import ClingoGrounder, ClingoSolver
+from popper.loop import build_rules, ground_rules
+from popper.constrain import Constrain
+from popper.generate import generate_program
+from popper.core import Clause
+from logging import DEBUG 
+from collections import Counter
+from popper.util import Stats
+import logging
+from popper.util import Settings, Stats
+from popper.tester import Tester
+from popper.constrain import Constrain
+from popper.generate import generate_program
+from popper.core import Clause, Literal, ConstVar
+from popper.asp import ClingoGrounder, ClingoSolver
+from popper.util import load_kbpath
+from popper.loop import Outcome, build_rules, decide_outcome, ground_rules
+from clingo import Function, Number, String
+
+# 🔹 Logging Setup
+logging.basicConfig(level=logging.DEBUG)
+log = logging.getLogger(__name__)
+
+OUTCOME_ENCODING = {"ALL": 1, "SOME": 2, "NONE": 3}
+OUTCOME_DECODING = {1: "ALL", 2: "SOME", 3: "NONE"}
+
+
+#OUTCOME_DECODING = {v: k for k, v in OUTCOME_ENCODING.items()}  # Reverse mapping
+
+class Con:
+    GENERALISATION = 'generalisation'
+    SPECIALISATION = 'specialisation'
+    REDUNDANCY = 'redundancy'
+    BANISH = 'banish'
+
+OUTCOME_TO_CONSTRAINTS = {
+        (Outcome.ALL, Outcome.NONE)  : (Con.BANISH,),
+        (Outcome.ALL, Outcome.SOME)  : (Con.GENERALISATION,),
+        (Outcome.SOME, Outcome.NONE) : (Con.SPECIALISATION,),
+        (Outcome.SOME, Outcome.SOME) : (Con.SPECIALISATION, Con.GENERALISATION),
+        (Outcome.NONE, Outcome.NONE) : (Con.SPECIALISATION, Con.REDUNDANCY),
+        (Outcome.NONE, Outcome.SOME) : (Con.SPECIALISATION, Con.REDUNDANCY, Con.GENERALISATION)
+    }
+
+
+
+# 🔹 Example Aggregation Table (Modify as Needed)
+AGGREGATION_TABLE_pos_outcome = {
+    ("all", "all"): "all",
+    ("all", "some"): "all",
+    ("all", "none"): "all",
+    ("some", "some"): "some",
+    ("some", "none"): "some",
+    ("none", "none"): "none",
+}
+
+AGGREGATION_TABLE_neg_outcome = {
+    ("some", "some"): "some",
+    ("some", "none"): "some",
+    ("none", "some"): "none",
+    ("none", "none"): "none",
+}
+
+
+def aggregate_outcomes(outcomes: List[Tuple[str, str]]) -> Tuple[str, str]:
+    """
+    Agrège une liste de paires d'outcomes (E+, E-) en utilisant des règles spécifiques pour chaque cas.
+    
+    :param outcomes: Liste de tuples contenant les outcomes sous forme de chaînes ('all', 'some', 'none').
+    :return: Une paire unique (E+, E-) agrégée.
+    """
+    valid_outcomes = [o for o in outcomes if len(o) == 2]
+    if not valid_outcomes:
+        log.warning("⚠️ No valid outcomes received! Using default (NONE, NONE).")
+        return ("none", "none")  # Default outcome
+
+    aggregated_E_plus = valid_outcomes[0][0]
+    aggregated_E_minus = valid_outcomes[0][1]
+
+    #aggregated_E_plus = outcomes[0][0]  # Prendre le premier E+
+    #aggregated_E_minus = outcomes[0][1]  # Prendre le premier E-
+
+    for E_plus, E_minus in outcomes[1:]:
+        # Agrégation spécifique pour E+
+        aggregated_E_plus = AGGREGATION_TABLE_pos_outcome.get(
+            (aggregated_E_plus, E_plus), aggregated_E_plus
+        )
+        # Agrégation spécifique pour E-
+        aggregated_E_minus = AGGREGATION_TABLE_neg_outcome.get(
+            (aggregated_E_minus, E_minus), aggregated_E_minus
+        )
+
+    return (aggregated_E_plus, aggregated_E_minus)
+
+
+def aggregate_popper(outcome_list: List[Tuple[int, int]]) -> List[np.ndarray]:
+    """
+    Aggregate constraints based on outcome pairs (E+, E-), generate new constraints,
+    and then use them to generate a new hypothesis (rules).
+
+    Args:
+        outcome_list (List[Tuple[int, int]]): List of encoded (E+, E-) pairs from clients.
+
+    Returns:
+        List[np.ndarray]: The new set of rules converted into a format ready to send to clients.
+    """
+    log.info(f"Received Outcomes: {outcome_list}")
+
+    # ✅ Étape 1 : Agréger les outcomes
+    outcomes = [outcomes for outcomes, _ in outcome_list]
+    aggregated_outcome = aggregate_outcomes([tuple(outcome[0]) for outcome in outcomes])
+    log.info(f"✅ Final Aggregated Outcome: {aggregated_outcome}")
+    
+    decoded_outcome = (
+    OUTCOME_DECODING[int(aggregated_outcome[0])],
+    OUTCOME_DECODING[int(aggregated_outcome[1])]
+)
+
+    # ✅ Étape 2 : **Normalisation immédiate**
+    
+# ✅ Convertir en valeurs normalisées avec la classe Outcome
+    normalized_outcome = (
+    Outcome.ALL if decoded_outcome[0].upper() == "ALL" else
+    Outcome.SOME if decoded_outcome[0].upper() == "SOME" else
+    Outcome.NONE,
+
+    Outcome.ALL if decoded_outcome[1].upper() == "ALL" else
+    Outcome.SOME if decoded_outcome[1].upper() == "SOME" else
+    Outcome.NONE
+)
+
+    log.info(f"🔹 Normalized Outcome: {normalized_outcome}")
+
+    # ✅ Étape 3 : Charger la base de connaissances
+    kbpath = "trains"
+    bk_file, ex_file, bias_file = load_kbpath(kbpath)
+
+    # ✅ Étape 4 : Initialiser les composants ILP
+    settings = Settings(bias_file, ex_file, bk_file)
+    tester = Tester(settings)
+    solver = ClingoSolver(settings)
+    constrainer = Constrain()
+    stats = Stats(log_best_programs=True)
+    grounder = ClingoGrounder()
+
+    # ✅ Étape 5 : Générer les règles initiales
+    log.debug("Generating initial rules...")
+    initial_rules, before, min_clause = generate_program(solver.get_model())
+
+    # ✅ Étape 6 : Générer des contraintes à partir du **outcome normalisé**
+    constraints = build_rules(settings, stats, constrainer, tester, initial_rules, before, min_clause, normalized_outcome)
+    log.debug(f"Generated Constraints: {constraints}")
+
+    if not constraints:
+        log.warning("⚠ No new constraints were generated. Returning original rules.")
+        return [np.array([str(rule) for rule in initial_rules])]  # Retourner les règles initiales si aucune contrainte n'est générée
+
+    # ✅ Étape 7 : Convertir les contraintes en un format utilisable par le solver
+    proper_constraints = set()
+    for head, body in constraints:
+        head_lit = None if head is None else Literal(head.predicate, head.arguments)
+        body_lits = frozenset(Literal(lit.predicate, lit.arguments) for lit in body)
+        proper_constraints.add((head_lit, body_lits))
+
+    # ✅ Étape 8 : Appliquer les contraintes et générer de nouvelles règles
+    grounded_constraints = ground_rules(stats, grounder, solver.max_clauses, solver.max_vars, proper_constraints)
+    solver.add_ground_clauses(grounded_constraints)
+    improved_rules, before, min_clause = generate_program(solver.get_model())
+
+    # ✅ Étape 9 : Convertir en format NumPy
+    #new_rules_ndarray = [np.array([str(rule) for rule in improved_rules])]
+
+    #log.info(f"🚀 Generated {len(new_rules_ndarray[0])} new rules for clients.")
+    
+    # ✅ Convertir les règles en format texte pour le client
+    #new_rules_as_text = [Clause.to_code(rule) for rule in improved_rules]
+    #new_rules_ndarray = [np.array(new_rules_as_text)]
+    
+    #new_rules_ndarray = [np.array([str((rule.head, rule.body)) for rule in improved_rules])]
+    new_rules_ndarray = [np.array([Clause.to_code(rule) for rule in improved_rules])]
+
+    #new_rules_ndarray = [np.array([str((rule.head, rule.body)) for rule in improved_rules])]
+
+    log.info(f"🚀 Sending {len(new_rules_ndarray[0])} rules to clients.")
+    return new_rules_ndarray  # Envoyer les règles bien formatées
+
+
+
+
+def aggregate_constraints(outcome_pairs: List[Tuple[int, int]]) -> NDArrays:
+        """
+        Aggregate constraints based on outcome pairs (E+, E-), generate new constraints,
+        and then use them to generate a new hypothesis (rules).
+
+        Args:
+            outcome_pairs (List[Tuple[int, int]]): List of encoded (E+, E-) pairs from clients.
+
+        Returns:
+            NDArrays: The new set of rules converted into a format ready to send to clients.
+        """
+        log.debug("Starting aggregation of constraints.")
+
+        constrainer = Constrain()
+        stats = Stats(log_best_programs=True)  # ✅ Initialize Stats here
+        grounder = ClingoGrounder()
+        solver = ClingoSolver()
+
+        # Step 1️⃣: Find the most common (E+, E-) outcome from clients
+        most_common_outcome, count = Counter(outcome_pairs).most_common(1)[0]
+        positive_outcome, negative_outcome = most_common_outcome  # (E+, E-)
+
+        log.debug(f"Most common outcome pair: {most_common_outcome} (Received from {count} clients)")
+
+        # Step 2️⃣: Select constraints based on the outcome pair
+        constraints_to_apply = OUTCOME_TO_CONSTRAINTS.get((positive_outcome, negative_outcome), [])
+        log.debug(f"Selected constraints to apply: {constraints_to_apply}")
+
+        # Step 3️⃣: Generate constraints
+        constraints = set()
+        for constraint_type in constraints_to_apply:
+            log.debug(f"Applying constraint: {constraint_type}")
+            if constraint_type == "generalisation":
+                constraints.update(constrainer.generalisation_constraint([], {}, {}))
+            elif constraint_type == "specialisation":
+                constraints.update(constrainer.specialisation_constraint([], {}, {}))
+            elif constraint_type == "redundancy":
+                constraints.update(constrainer.redundancy_constraint([], {}, {}))
+            elif constraint_type == "banish":
+                constraints.update(constrainer.banish_constraint([], {}, {}))
+
+        log.debug(f"Total constraints generated: {len(constraints)}")
+
+        # Step 4️⃣: Generate new rules using constraints
+        rules = build_rules(constraints)
+        log.debug(f"Total rules generated: {len(rules)}")
+        # ✅ Step 5: Ground the rules
+        
+       
+        #rules = ground_rules(stats, grounder, solver.max_clauses, solver.max_vars, rules)
+        #log.debug(f"Total rules grounded: {len(rules)}")
+        
+
+        # Step 5️⃣: Convert rules into a NumPy array to send back to clients
+        new_rules_ndarray = [np.array([str(rule) for rule in rules])]
+        log.debug(f"Sending {len(new_rules_ndarray[0])} rules to clients.")
+        return new_rules_ndarray  # New hypothesis (rules)
+
 
 def aggregate(results: List[Tuple[NDArrays, int]]) -> NDArrays:
     """Compute weighted average."""
@@ -44,40 +293,7 @@ def aggregate(results: List[Tuple[NDArrays, int]]) -> NDArrays:
     return weights_prime
 
 
-def aggregate_ilp(results: List[Tuple[np.ndarray, int]]) -> np.ndarray:
-    """Aggregate rules using union."""
-    aggregated_rules = OrderedSet()
 
-    for serialized_rules, _ in results:
-        # Deserialize and merge rules
-        local_rules = helper.deserialize_ordered_set(serialized_rules)
-        aggregated_rules |= local_rules
-
-    # Serialize back to NumPy array
-    return helper.ordered_set_to_ndarray(aggregated_rules)
-
-def aggregate_fedilp(results: List[Tuple[NDArrays, int]]) -> NDArrays:
-    log(INFO, "Aggregate results from federated ILP.")
-    # step 1 convert list of ndarrays to tensors 
-    tensors = [torch.tensor(result[0]) for result in results]
-    # step 2 convert tensors to text 
-    texts = [helper.tensor_to_text(tensor) for tensor in tensors]
-    # step 3 convert text to OrderedSet 
-    ordered_sets= [helper.text_to_ordered_set(text) for text in texts]
-    # step 4 do the union to rules 
-    union_set = OrderedSet()
-    for ordered_set in ordered_sets:
-        union_set |= ordered_set
-    # step5: convert orderedset to text then to tensors then to ndarray 
-    log(INFO, "Requesting initial parameters from one random client", union_set)
-    text_union = OrderedSet.__str__(union_set)
-    #step6: convert text back to tensors
-    tensor_union = helper.text_to_tensor(text_union)
-    #step7: convert tensors back to ndarrays but before to parameters
-    tensor_parameters = helper.tensor_to_parameters(tensor_union)
-    ndarrays = parameters_to_ndarrays(tensor_parameters)
-    # return the ndarray send back 
-    return ndarrays
 
 
 
