@@ -34,6 +34,7 @@ class FedPopper(Strategy):
         self,
         settings: Settings,
         tester: Tester, 
+        current_hypothesis = None,
         fraction_fit: float = 1.0,
         fraction_evaluate: float = 1.0,
         min_fit_clients: int = 2,
@@ -52,6 +53,7 @@ class FedPopper(Strategy):
         self.min_available_clients = min_available_clients
         self.initial_parameters = initial_parameters
         self.fit_metrics_aggregation_fn = fit_metrics_aggregation_fn
+        self.current_hypothesis = current_hypothesis
 
     def __repr__(self) -> str:
         return "FedConstraints"
@@ -108,8 +110,13 @@ class FedPopper(Strategy):
         
         log(DEBUG, f"Received encoded outcomes from clients: {outcome_results}")
         # ✅ Step 2: Aggregate outcomes and generate new rules
-        new_rules = aggregate_popper(outcome_results)
-        
+        new_rules = aggregate_popper(outcome_results, self.current_hypothesis)
+        # ✅ Store the hypothesis for the next round
+        if new_rules and len(new_rules[0]) > 0:
+            self.current_hypothesis = new_rules
+            log(DEBUG,"✅ Updated current hypothesis for next round.")
+        else:
+            log.warning("⚠ No new hypothesis generated, keeping the previous one.")
         log(DEBUG, f"Generated hypothesis (new rules) from constraints: {new_rules}")
 
 

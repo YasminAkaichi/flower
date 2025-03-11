@@ -31,7 +31,6 @@ from popper.asp import ClingoGrounder, ClingoSolver
 from popper.loop import build_rules, ground_rules
 from popper.constrain import Constrain
 from popper.generate import generate_program
-from popper.core import Clause
 from logging import DEBUG 
 from collections import Counter
 from popper.util import Stats
@@ -122,7 +121,7 @@ def aggregate_outcomes(outcomes: List[Tuple[str, str]]) -> Tuple[str, str]:
     return (aggregated_E_plus, aggregated_E_minus)
 
 
-def aggregate_popper(outcome_list: List[Tuple[int, int]]) -> List[np.ndarray]:
+def aggregate_popper(outcome_list: List[Tuple[int, int]], current_hypothesis) -> List[np.ndarray]:
     """
     Aggregate constraints based on outcome pairs (E+, E-), generate new constraints,
     and then use them to generate a new hypothesis (rules).
@@ -172,17 +171,46 @@ def aggregate_popper(outcome_list: List[Tuple[int, int]]) -> List[np.ndarray]:
     stats = Stats(log_best_programs=True)
     grounder = ClingoGrounder()
 
-    # ✅ Étape 5 : Générer les règles initiales
-    log.debug("Generating initial rules...")
-    initial_rules, before, min_clause = generate_program(solver.get_model())
+    if current_hypothesis is None:
+        log.debug("🚀 No existing hypothesis found, starting fresh.")
+        current_rules, before, min_clause = generate_program(solver.get_model())
+    else:
+        if isinstance(current_hypothesis, np.ndarray):
+            current_hypothesis = current_hypothesis.flatten().tolist()
+        elif isinstance(current_hypothesis, list) and isinstance(current_hypothesis[0], np.ndarray):
+            current_hypothesis = [str(rule) for arr in current_hypothesis for rule in arr]
 
-    # ✅ Étape 6 : Générer des contraintes à partir du **outcome normalisé**
-    constraints = build_rules(settings, stats, constrainer, tester, initial_rules, before, min_clause, normalized_outcome)
-    log.debug(f"Generated Constraints: {constraints}")
+        print(f"🔍 Debug: Fixed current_hypothesis = {current_hypothesis}")
 
+        # ✅ Convert to Clause objects, skipping malformed ones
+        valid_rules = []
+        for rule in current_hypothesis:
+            rule = str(rule).strip()
+            if ':-' in rule:
+                head_body = rule.split(':-')
+                if len(head_body) == 2 and '(' in head_body[0] and '(' in head_body[1]:
+                    try:
+                        valid_rules.append(Clause.from_string(rule))
+                    except Exception as e:
+                        log.warning(f"⚠ Skipping malformed rule: {rule} | Error: {e}")
+                else:
+                    log.warning(f"⚠ Skipping invalid rule (missing literals): {rule}")
+            else:
+                log.warning(f"⚠ Skipping invalid rule (missing ':-' separator): {rule}")
+
+        current_rules = valid_rules
+        before = {}  # ✅ Ensure 'before' is defined
+        min_clause = {clause: 1 for clause in current_rules}  # ✅ Define min_clause
+        log.debug(f"🔄 Current Hypothesis Loaded: {len(current_rules)} rules")
+    
+    # ✅ Step 6: Generate Constraints from the Normalized Outcome
+    constraints = build_rules(settings, stats, constrainer, tester, current_rules, before, min_clause, normalized_outcome)
+    log.debug(f"🔍 Generated Constraints: {constraints}")
+
+    
     if not constraints:
         log.warning("⚠ No new constraints were generated. Returning original rules.")
-        return [np.array([str(rule) for rule in initial_rules])]  # Retourner les règles initiales si aucune contrainte n'est générée
+        return [np.array([str(rule) for rule in current_rules])]  # Retourner les règles initiales si aucune contrainte n'est générée
 
     # ✅ Étape 7 : Convertir les contraintes en un format utilisable par le solver
     proper_constraints = set()
@@ -197,18 +225,8 @@ def aggregate_popper(outcome_list: List[Tuple[int, int]]) -> List[np.ndarray]:
     improved_rules, before, min_clause = generate_program(solver.get_model())
 
     # ✅ Étape 9 : Convertir en format NumPy
-    #new_rules_ndarray = [np.array([str(rule) for rule in improved_rules])]
 
-    #log.info(f"🚀 Generated {len(new_rules_ndarray[0])} new rules for clients.")
-    
-    # ✅ Convertir les règles en format texte pour le client
-    #new_rules_as_text = [Clause.to_code(rule) for rule in improved_rules]
-    #new_rules_ndarray = [np.array(new_rules_as_text)]
-    
-    #new_rules_ndarray = [np.array([str((rule.head, rule.body)) for rule in improved_rules])]
     new_rules_ndarray = [np.array([Clause.to_code(rule) for rule in improved_rules])]
-
-    #new_rules_ndarray = [np.array([str((rule.head, rule.body)) for rule in improved_rules])]
 
     log.info(f"🚀 Sending {len(new_rules_ndarray[0])} rules to clients.")
     return new_rules_ndarray  # Envoyer les règles bien formatées
