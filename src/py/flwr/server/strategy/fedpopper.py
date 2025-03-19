@@ -22,19 +22,24 @@ from collections import OrderedDict
 from popper.util import Settings
 from popper.tester import Tester
 from popper.core import Clause
-
+from popper.util import Settings, Stats
 from logging import DEBUG
 import logging
-
+import numpy as np 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class FedPopper(Strategy):
     def __init__(
         self,
-        settings: Settings,
-        tester: Tester, 
+        settings: None,
         current_hypothesis = None,
+        current_before = None,
+        current_min_clause = None,
+        stats = None,
+        solver = None,
+        grounder = None,
+        constrainer = None,
         fraction_fit: float = 1.0,
         fraction_evaluate: float = 1.0,
         min_fit_clients: int = 2,
@@ -45,7 +50,6 @@ class FedPopper(Strategy):
     ) -> None:
         super().__init__()
         self.settings = settings
-        self.tester = tester
         self.fraction_fit = fraction_fit
         self.fraction_evaluate = fraction_evaluate
         self.min_fit_clients = min_fit_clients
@@ -54,17 +58,27 @@ class FedPopper(Strategy):
         self.initial_parameters = initial_parameters
         self.fit_metrics_aggregation_fn = fit_metrics_aggregation_fn
         self.current_hypothesis = current_hypothesis
-
+        self.current_before = current_before
+        self.current_min_clause = current_min_clause
+        self.solver = solver
+        self.grounder = grounder
+        self.constrainer = constrainer
+        self.stats = stats if stats else Stats(log_best_programs = True)
     def __repr__(self) -> str:
         return "FedConstraints"
-
+    
     def initialize_parameters(
         self, client_manager: ClientManager
     ) -> Optional[Parameters]:
         """Initialize global model parameters."""
-        initial_parameters = self.initial_parameters
-        self.initial_parameters = None  # Don't keep initial parameters in memory
-        return initial_parameters
+        if self.current_hypothesis: 
+            log(DEBUG,"Sending stored hypothesis to clients")
+            return ndarrays_to_parameters(np.array(self.current_hypothesis, dtype="<U100"))
+        log(WARNING,"No stored hypothesis, sending initial parameters.")
+
+        #initial_parameters = self.initial_parameters
+        #self.initial_parameters = None  # Don't keep initial parameters in memory
+        return self.initial_parameters
 
     def configure_fit(
         self, server_round: int, parameters: Parameters, client_manager: ClientManager
@@ -101,7 +115,7 @@ class FedPopper(Strategy):
         failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
     ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
         """Aggregate fit results using the ILP aggregation method."""
-
+        
         # ✅ Step 1: Extract outcome pairs (E+, E-) and number of examples
         outcome_results = [
             (parameters_to_ndarrays(fit_res.parameters), fit_res.num_examples)
@@ -110,19 +124,24 @@ class FedPopper(Strategy):
         
         log(DEBUG, f"Received encoded outcomes from clients: {outcome_results}")
         # ✅ Step 2: Aggregate outcomes and generate new rules
-        new_rules = aggregate_popper(outcome_results, self.current_hypothesis)
+        new_rules, solver, stats, min_clause, before = aggregate_popper(outcome_results, self.settings, self.solver, self.stats,self.current_hypothesis,self.current_min_clause, self.current_before)
         # ✅ Store the hypothesis for the next round
         if new_rules and len(new_rules[0]) > 0:
             self.current_hypothesis = new_rules
-            log(DEBUG,"✅ Updated current hypothesis for next round.")
-        else:
-            log.warning("⚠ No new hypothesis generated, keeping the previous one.")
-        log(DEBUG, f"Generated hypothesis (new rules) from constraints: {new_rules}")
+            self.current_before = before
+            self.current_min_clause = min_clause
+            #self.stats = updated_stats
+            log(DEBUG,"✅ Updated current hypothesis and constraints for next round.")
+        if solver and stats:
+            self.stats = stats
+            log(DEBUG,"✅ Updated current stats and solver for next round.")
+    
+        #log(DEBUG, f"Generated hypothesis (new rules) from constraints: {new_rules}")
 
-
+        new_rules_ndarray = np.array(new_rules, dtype="<U100")
 
         # ✅ Step 3: Convert rules to Flower parameters
-        parameters_aggregated = ndarrays_to_parameters(new_rules)
+        parameters_aggregated = ndarrays_to_parameters(new_rules_ndarray)
 
         # ✅ Step 4: Aggregate custom metrics if provided
         metrics_aggregated = {}
@@ -133,6 +152,7 @@ class FedPopper(Strategy):
             log(WARNING, "No fit_metrics_aggregation_fn provided")
 
         return parameters_aggregated, metrics_aggregated
+    
 
     def configure_evaluate(
         self, server_round: int, parameters: Parameters, client_manager: ClientManager
@@ -187,8 +207,7 @@ class FedPopper(Strategy):
         self, server_round: int, parameters: Parameters
     ) -> Optional[Tuple[float, Dict[str, Scalar]]]:
         """Evaluate global model parameters using an evaluation function."""
-
-        # Let's assume we won't perform the global model evaluation on the server side.
+        
         return None
 
     def num_fit_clients(self, num_available_clients: int) -> Tuple[int, int]:

@@ -14,12 +14,13 @@
 # ==============================================================================
 """Aggregation functions for strategy implementations."""
 # mypy: disallow_untyped_calls=False
-
+from logging import WARNING
+from flwr.common.logger import log
 from functools import reduce
 from typing import Any, Callable, List, Tuple
 import torch 
 import numpy as np
-from flwr.common import FitRes, NDArray, NDArrays, parameters_to_ndarrays
+from flwr.common import FitRes, NDArray, NDArrays, parameters_to_ndarrays, ndarray_to_bytes
 from flwr.server.client_proxy import ClientProxy
 from flwr.common.logger import log
 from logging import INFO, WARN
@@ -35,16 +36,15 @@ from logging import DEBUG
 from collections import Counter
 from popper.util import Stats
 import logging
-from popper.util import Settings, Stats
 from popper.tester import Tester
 from popper.constrain import Constrain
-from popper.generate import generate_program
 from popper.core import Clause, Literal, ConstVar
 from popper.asp import ClingoGrounder, ClingoSolver
-from popper.util import load_kbpath
-from popper.loop import Outcome, build_rules, decide_outcome, ground_rules
+from popper.util import load_kbpath, parse_settings,  Settings, Stats
+from popper.loop import Outcome, build_rules, decide_outcome, ground_rules, Con,calc_score
 from clingo import Function, Number, String
-
+from typing import List, Tuple, Dict
+import re 
 # 🔹 Logging Setup
 logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger(__name__)
@@ -53,13 +53,7 @@ OUTCOME_ENCODING = {"ALL": 1, "SOME": 2, "NONE": 3}
 OUTCOME_DECODING = {1: "ALL", 2: "SOME", 3: "NONE"}
 
 
-#OUTCOME_DECODING = {v: k for k, v in OUTCOME_ENCODING.items()}  # Reverse mapping
 
-class Con:
-    GENERALISATION = 'generalisation'
-    SPECIALISATION = 'specialisation'
-    REDUNDANCY = 'redundancy'
-    BANISH = 'banish'
 
 OUTCOME_TO_CONSTRAINTS = {
         (Outcome.ALL, Outcome.NONE)  : (Con.BANISH,),
@@ -88,6 +82,7 @@ AGGREGATION_TABLE_neg_outcome = {
     ("none", "some"): "none",
     ("none", "none"): "none",
 }
+
 
 
 def aggregate_outcomes(outcomes: List[Tuple[str, str]]) -> Tuple[str, str]:
@@ -121,176 +116,174 @@ def aggregate_outcomes(outcomes: List[Tuple[str, str]]) -> Tuple[str, str]:
     return (aggregated_E_plus, aggregated_E_minus)
 
 
-def aggregate_popper(outcome_list: List[Tuple[int, int]], current_hypothesis) -> List[np.ndarray]:
+def transform_rule_to_tester_format(rule_str):
+    log.debug(f"🔍 Transforming rule: {rule_str}")
+
+    try:
+        # ✅ Split head and body correctly
+        head_body = rule_str.split(":-")
+        if len(head_body) != 2:
+            raise ValueError(f"Invalid rule format: {rule_str}")
+
+        head_str = head_body[0].strip()
+        body_str = head_body[1].strip()
+
+        # ✅ **Fix: Properly extract body literals using regex**
+        body_literals = re.findall(r'\w+\(.*?\)', body_str)
+
+        log.debug(f"🔹 Parsed head: {head_str}")
+        log.debug(f"🔹 Parsed body literals: {body_literals}")
+
+        # ✅ Convert to Literal objects (assuming `Literal.from_string` exists)
+        head = Literal.from_string(head_str)
+        body = tuple(Literal.from_string(lit) for lit in body_literals)
+
+        formatted_rule = (head, body)
+        log.debug(f"✅ Formatted rule: {formatted_rule}")
+
+        return formatted_rule
+    except Exception as e:
+        log.error(f"❌ Error transforming rule: {rule_str} → {e}")
+        return None  # Return None to indicate failure
+    
+
+def aggregate_popper(outcome_list: List[Tuple[int, int]], settings, solver, stats, current_hypothesis, current_min_clause, current_before):
     """
     Aggregate constraints based on outcome pairs (E+, E-), generate new constraints,
     and then use them to generate a new hypothesis (rules).
-
-    Args:
-        outcome_list (List[Tuple[int, int]]): List of encoded (E+, E-) pairs from clients.
-
-    Returns:
-        List[np.ndarray]: The new set of rules converted into a format ready to send to clients.
     """
+    
     log.info(f"Received Outcomes: {outcome_list}")
-
-    # ✅ Étape 1 : Agréger les outcomes
+    
+    # ✅ Step 1: Aggregate Outcomes
     outcomes = [outcomes for outcomes, _ in outcome_list]
     aggregated_outcome = aggregate_outcomes([tuple(outcome[0]) for outcome in outcomes])
     log.info(f"✅ Final Aggregated Outcome: {aggregated_outcome}")
     
+    # ✅ Step 2: Normalize Outcome
     decoded_outcome = (
-    OUTCOME_DECODING[int(aggregated_outcome[0])],
-    OUTCOME_DECODING[int(aggregated_outcome[1])]
-)
-
-    # ✅ Étape 2 : **Normalisation immédiate**
+        OUTCOME_DECODING[int(aggregated_outcome[0])],
+        OUTCOME_DECODING[int(aggregated_outcome[1])]
+    )
     
-# ✅ Convertir en valeurs normalisées avec la classe Outcome
     normalized_outcome = (
-    Outcome.ALL if decoded_outcome[0].upper() == "ALL" else
-    Outcome.SOME if decoded_outcome[0].upper() == "SOME" else
-    Outcome.NONE,
+        Outcome.ALL if decoded_outcome[0].upper() == "ALL" else Outcome.SOME if decoded_outcome[0].upper() == "SOME" else Outcome.NONE,
+        Outcome.ALL if decoded_outcome[1].upper() == "ALL" else Outcome.SOME if decoded_outcome[1].upper() == "SOME" else Outcome.NONE
+    )
+    
+    log.info(f"✅ Final Aggregated Outcome: {normalized_outcome}")
 
-    Outcome.ALL if decoded_outcome[1].upper() == "ALL" else
-    Outcome.SOME if decoded_outcome[1].upper() == "SOME" else
-    Outcome.NONE
-)
+    #stats = Stats(log_best_programs=settings.info)
 
+    # ✅ Step 3: Load Knowledge Base
+    kbpath = "trains"
+    _, _, bias_file = load_kbpath(kbpath)
+    
+    # ✅ Step 4: Initialize ILP Components
+    #settings = Settings(bias_file, "","")
+    tester = Tester(settings)
+    constrainer = Constrain()
+    grounder = ClingoGrounder()
+   
+    # ✅ Step 8: Restore `before` and `min_clause`
+    #before = current_before if current_before else {tuple(rule): set() for rule in current_rules}
+    #min_clause = current_min_clause if current_min_clause else {tuple(rule): 1 for rule in current_rules}
+    conf_matrix= (0,0,0,0)
+    if current_hypothesis is None: 
+        log.debug("Generate new first hypothesis")
+    # Generate Hypothesis 
+        with stats.duration('generate'):
+            model = solver.get_model()
+            if not model:
+                log(WARNING,"No model in solver")
+            (current_rules, before, min_clause) = generate_program(model)
+            current_hypothesis = current_rules
+            current_before = before
+            current_min_clause = min_clause
+            stats.register_hypothesis(current_rules)
+    else:
+        log.debug("Use the existing hypothesis")
+        try:
+            # ✅ Convert received rules into Clause objects
+            hypo = np.array(current_hypothesis, dtype="<U100") 
+            received_rules = hypo[0].tolist()
+            parsed_rules = [transform_rule_to_tester_format(rule) for rule in received_rules]
+            #
+            # 🔹 Remove any None values (failed transformations)
+            current_rules = [rule for rule in parsed_rules if rule is not None]
+            stats.register_hypothesis(current_rules)
+            log.debug(f"✅ Updated client hypothesis: {current_rules}")
+        except Exception as e:
+            log.error(f"❌ Error processing received rules: {e}")
+            current_rules = []  # Reset to empty if parsing fails
+        #if isinstance(current_hypothesis, np.ndarray):  
+        #    current_hypothesis = current_hypothesis.flatten().tolist() # Convert ndarray to list of strings 
+        #elif isinstance(current_hypothesis, list) and isinstance(current_hypothesis[0], np.ndarray):  
+        #    current_hypothesis = [str(rule) for arr in current_hypothesis for rule in arr] # Handle nested arrays   
+        
+        
+    log.debug(f"🔍 Rules before applying constraints: {current_rules}")     
+    
+
+    before = current_before if current_before else {rule: set() for rule in current_rules} 
+
+    min_clause = current_min_clause if current_min_clause else {rule: 1 for rule in current_rules} 
+    
     log.info(f"🔹 Normalized Outcome: {normalized_outcome}")
 
-    # ✅ Étape 3 : Charger la base de connaissances
-    kbpath = "trains"
-    bk_file, ex_file, bias_file = load_kbpath(kbpath)
-
-    # ✅ Étape 4 : Initialiser les composants ILP
-    settings = Settings(bias_file, ex_file, bk_file)
-    tester = Tester(settings)
-    solver = ClingoSolver(settings)
-    constrainer = Constrain()
-    stats = Stats(log_best_programs=True)
-    grounder = ClingoGrounder()
-
-    if current_hypothesis is None:
-        log.debug("🚀 No existing hypothesis found, starting fresh.")
-        current_rules, before, min_clause = generate_program(solver.get_model())
-    else:
-        if isinstance(current_hypothesis, np.ndarray):
-            current_hypothesis = current_hypothesis.flatten().tolist()
-        elif isinstance(current_hypothesis, list) and isinstance(current_hypothesis[0], np.ndarray):
-            current_hypothesis = [str(rule) for arr in current_hypothesis for rule in arr]
-
-        print(f"🔍 Debug: Fixed current_hypothesis = {current_hypothesis}")
-
-        # ✅ Convert to Clause objects, skipping malformed ones
-        valid_rules = []
-        for rule in current_hypothesis:
-            rule = str(rule).strip()
-            if ':-' in rule:
-                head_body = rule.split(':-')
-                if len(head_body) == 2 and '(' in head_body[0] and '(' in head_body[1]:
-                    try:
-                        valid_rules.append(Clause.from_string(rule))
-                    except Exception as e:
-                        log.warning(f"⚠ Skipping malformed rule: {rule} | Error: {e}")
-                else:
-                    log.warning(f"⚠ Skipping invalid rule (missing literals): {rule}")
-            else:
-                log.warning(f"⚠ Skipping invalid rule (missing ':-' separator): {rule}")
-
-        current_rules = valid_rules
-        before = {}  # ✅ Ensure 'before' is defined
-        min_clause = {clause: 1 for clause in current_rules}  # ✅ Define min_clause
-        log.debug(f"🔄 Current Hypothesis Loaded: {len(current_rules)} rules")
+    if normalized_outcome == (Outcome.ALL, Outcome.NONE):
+        log.debug("get_out_rounds, we okay")
+        stats.register_best_hypothesis(current_rules)
+        new_rules_bytes = [Clause.to_code(rule) for rule in current_rules]
+        new_rules_ndarray = np.array(new_rules_bytes, dtype="<U100")
+        return [new_rules_ndarray], solver, stats, current_min_clause, current_before
     
-    # ✅ Step 6: Generate Constraints from the Normalized Outcome
-    constraints = build_rules(settings, stats, constrainer, tester, current_rules, before, min_clause, normalized_outcome)
+
+    # ✅ Step 7: Generate Constraints with Stats Tracking
+    with stats.duration('build'):
+        constraints = build_rules(settings, stats, constrainer, tester, current_rules, current_before, current_min_clause, normalized_outcome)
+
     log.debug(f"🔍 Generated Constraints: {constraints}")
 
-    
-    if not constraints:
-        log.warning("⚠ No new constraints were generated. Returning original rules.")
-        return [np.array([str(rule) for rule in current_rules])]  # Retourner les règles initiales si aucune contrainte n'est générée
-
-    # ✅ Étape 7 : Convertir les contraintes en un format utilisable par le solver
     proper_constraints = set()
+
     for head, body in constraints:
-        head_lit = None if head is None else Literal(head.predicate, head.arguments)
+        # Convert head if it's not None
+        if head is None:
+            head_lit = None  # No head for some constraints
+        else:
+            head_lit = Literal(head.predicate, head.arguments)  # Convert tuple back to Literal
+
+        # Convert each body item back to Literal and store as frozenset
         body_lits = frozenset(Literal(lit.predicate, lit.arguments) for lit in body)
+
+        # ✅ Store as a tuple with a frozenset to be hashable
         proper_constraints.add((head_lit, body_lits))
 
-    # ✅ Étape 8 : Appliquer les contraintes et générer de nouvelles règles
-    grounded_constraints = ground_rules(stats, grounder, solver.max_clauses, solver.max_vars, proper_constraints)
-    solver.add_ground_clauses(grounded_constraints)
-    improved_rules, before, min_clause = generate_program(solver.get_model())
+    # ✅ Step 8: Apply Constraints & Generate New Rules
 
-    # ✅ Étape 9 : Convertir en format NumPy
+    log.debug(f"🔍 Constraints BEFORE grounding: {proper_constraints}")
 
-    new_rules_ndarray = [np.array([Clause.to_code(rule) for rule in improved_rules])]
+    with stats.duration('ground'):
+        grounded_constraints = ground_rules(stats, grounder, solver.max_clauses, solver.max_vars, constraints)
+    
+    log.debug(f"🔍 Generated Constraints: {solver.get_model()}")
+    with stats.duration('add'):
+        solver.add_ground_clauses(grounded_constraints)
+    
 
-    log.info(f"🚀 Sending {len(new_rules_ndarray[0])} rules to clients.")
-    return new_rules_ndarray  # Envoyer les règles bien formatées
+    with stats.duration('generate'):
+        current_rules, before, min_clause = generate_program(solver.get_model())
+        current_before = before
+        current_min_clause = min_clause
 
+    new_rules_bytes = [Clause.to_code(rule) for rule in current_rules]
 
+    new_rules_ndarray = np.array(new_rules_bytes, dtype="<U100")
 
+    log.info(f"🚀 Sending {len(new_rules_ndarray)} rules to clients.")
 
-def aggregate_constraints(outcome_pairs: List[Tuple[int, int]]) -> NDArrays:
-        """
-        Aggregate constraints based on outcome pairs (E+, E-), generate new constraints,
-        and then use them to generate a new hypothesis (rules).
-
-        Args:
-            outcome_pairs (List[Tuple[int, int]]): List of encoded (E+, E-) pairs from clients.
-
-        Returns:
-            NDArrays: The new set of rules converted into a format ready to send to clients.
-        """
-        log.debug("Starting aggregation of constraints.")
-
-        constrainer = Constrain()
-        stats = Stats(log_best_programs=True)  # ✅ Initialize Stats here
-        grounder = ClingoGrounder()
-        solver = ClingoSolver()
-
-        # Step 1️⃣: Find the most common (E+, E-) outcome from clients
-        most_common_outcome, count = Counter(outcome_pairs).most_common(1)[0]
-        positive_outcome, negative_outcome = most_common_outcome  # (E+, E-)
-
-        log.debug(f"Most common outcome pair: {most_common_outcome} (Received from {count} clients)")
-
-        # Step 2️⃣: Select constraints based on the outcome pair
-        constraints_to_apply = OUTCOME_TO_CONSTRAINTS.get((positive_outcome, negative_outcome), [])
-        log.debug(f"Selected constraints to apply: {constraints_to_apply}")
-
-        # Step 3️⃣: Generate constraints
-        constraints = set()
-        for constraint_type in constraints_to_apply:
-            log.debug(f"Applying constraint: {constraint_type}")
-            if constraint_type == "generalisation":
-                constraints.update(constrainer.generalisation_constraint([], {}, {}))
-            elif constraint_type == "specialisation":
-                constraints.update(constrainer.specialisation_constraint([], {}, {}))
-            elif constraint_type == "redundancy":
-                constraints.update(constrainer.redundancy_constraint([], {}, {}))
-            elif constraint_type == "banish":
-                constraints.update(constrainer.banish_constraint([], {}, {}))
-
-        log.debug(f"Total constraints generated: {len(constraints)}")
-
-        # Step 4️⃣: Generate new rules using constraints
-        rules = build_rules(constraints)
-        log.debug(f"Total rules generated: {len(rules)}")
-        # ✅ Step 5: Ground the rules
-        
-       
-        #rules = ground_rules(stats, grounder, solver.max_clauses, solver.max_vars, rules)
-        #log.debug(f"Total rules grounded: {len(rules)}")
-        
-
-        # Step 5️⃣: Convert rules into a NumPy array to send back to clients
-        new_rules_ndarray = [np.array([str(rule) for rule in rules])]
-        log.debug(f"Sending {len(new_rules_ndarray[0])} rules to clients.")
-        return new_rules_ndarray  # New hypothesis (rules)
+    return [new_rules_ndarray], solver, stats, current_min_clause, current_before
 
 
 def aggregate(results: List[Tuple[NDArrays, int]]) -> NDArrays:
