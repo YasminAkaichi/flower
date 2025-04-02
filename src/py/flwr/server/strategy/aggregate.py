@@ -1,19 +1,3 @@
-# Copyright 2020 Flower Labs GmbH. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Aggregation functions for strategy implementations."""
-# mypy: disallow_untyped_calls=False
 from logging import WARNING
 from flwr.common.logger import log
 from functools import reduce
@@ -147,7 +131,175 @@ def transform_rule_to_tester_format(rule_str):
         return None  # Return None to indicate failure
     
 
-def aggregate_popper(outcome_list: List[Tuple[int, int]], settings, solver, stats, current_hypothesis, current_min_clause, current_before):
+def aggregate_popper0(outcome_list, settings, solver, grounder, constrainer, tester, stats,
+                     current_hypothesis, current_min_clause, current_before, clause_size):
+    """
+    Tries to generate a valid hypothesis by increasing clause size if needed.
+    """
+    
+
+    log.info(f"Received Outcomes: {outcome_list}")
+
+    outcomes = [outcomes for outcomes, _ in outcome_list]
+    aggregated_outcome = aggregate_outcomes([tuple(outcome[0]) for outcome in outcomes])
+
+    decoded_outcome = (
+        OUTCOME_DECODING[int(aggregated_outcome[0])],
+        OUTCOME_DECODING[int(aggregated_outcome[1])],
+    )
+
+    normalized_outcome = (
+        Outcome.ALL if decoded_outcome[0].upper() == "ALL" else Outcome.SOME if decoded_outcome[0].upper() == "SOME" else Outcome.NONE,
+        Outcome.ALL if decoded_outcome[1].upper() == "ALL" else Outcome.SOME if decoded_outcome[1].upper() == "SOME" else Outcome.NONE,
+    )
+
+    log.info(f"\u2705 Normalized Outcome: {normalized_outcome}")
+
+    stop = False
+    current_rules = []
+    if current_hypothesis is None:
+        log.debug("Generating new initial hypothesis")
+        with stats.duration('generate'):
+            model = solver.get_model()
+            if not model:
+                log.warning("⚠️ No model generated — increasing clause_size")
+                clause_size += 1
+            current_rules, current_before, current_min_clause = generate_program(model)
+            current_hypothesis = current_rules
+            stats.register_hypothesis(current_rules)
+    else:
+        try:
+            hypo = np.array(current_hypothesis, dtype="<U100")
+            received_rules = hypo[0].tolist()
+            parsed_rules = [transform_rule_to_tester_format(rule) for rule in received_rules]
+            current_rules = [rule for rule in parsed_rules if rule is not None]
+            stats.register_hypothesis(current_rules)
+        except Exception as e:
+            log.error(f"Error processing hypothesis: {e}")
+            current_rules = []
+    while clause_size <= settings.max_literals:
+        log.debug(f"******************** MAX LITERALS: {clause_size} ********************")
+
+        solver.update_number_of_literals(clause_size)
+        stats.update_num_literals(clause_size)
+        
+
+        with stats.duration("generate"):
+            model = solver.get_model()
+            if not model:
+                log.warning("No model after constraints. Breaking loop.")
+                rule_ndarray = np.array([], dtype="<U100")
+                clause_size += 1
+                return [rule_ndarray], stats, current_min_clause, current_before, clause_size
+            current_rules, before, min_clause = generate_program(model)
+            current_before = before
+            current_min_clause = min_clause
+            stats.register_hypothesis(current_rules)
+        if normalized_outcome == (Outcome.ALL, Outcome.NONE):
+            log.debug("Perfect hypothesis found")
+            stop = True
+            stats.register_best_hypothesis(current_rules)
+            new_rules_bytes = [Clause.to_code(rule) for rule in current_rules]
+            new_rules_ndarray = np.array(new_rules_bytes, dtype="<U100")
+            return [new_rules_ndarray], stats, current_min_clause, current_before, clause_size
+
+        with stats.duration('build'):
+            constraints = build_rules(settings, stats, constrainer, tester,
+                                      current_rules, current_before, current_min_clause, normalized_outcome)
+
+        with stats.duration('ground'):
+            grounded = ground_rules(stats, grounder, solver.max_clauses, solver.max_vars, constraints)
+
+        with stats.duration('add'):
+            solver.add_ground_clauses(grounded)
+
+
+        new_rules_bytes = [Clause.to_code(rule) for rule in current_rules]
+        new_rules_ndarray = np.array(new_rules_bytes, dtype="<U100")
+        return [new_rules_ndarray], stats, current_min_clause, current_before, clause_size
+
+    log.warning("❌ Max clause size reached. No valid model found.")
+    return [np.array([], dtype="<U100")], stats, current_min_clause, current_before, clause_size
+
+
+def aggregate_popper1(
+    outcome_list: List[Tuple[int, int]],
+    settings,
+    solver,
+    grounder,
+    constrainer,
+    tester,
+    stats,
+    current_hypothesis,
+    current_min_clause,
+    current_before,
+    clause_size,
+):
+    """
+    Aggregate constraints based on outcome pairs (E+, E-), generate new constraints,
+    and then use them to generate a new hypothesis (rules),
+    mimicking Popper's inner while loop.
+    """
+    log.info(f"Received Outcomes: {outcome_list}")
+
+    # Step 1: Aggregate and normalize outcomes
+    outcomes = [outcome for outcome, _ in outcome_list]
+    aggregated_outcome = aggregate_outcomes([tuple(outcome[0]) for outcome in outcomes])
+    decoded_outcome = (
+        OUTCOME_DECODING[int(aggregated_outcome[0])],
+        OUTCOME_DECODING[int(aggregated_outcome[1])],
+    )
+    normalized_outcome = (
+        Outcome.ALL if decoded_outcome[0].upper() == "ALL" else Outcome.SOME if decoded_outcome[0].upper() == "SOME" else Outcome.NONE,
+        Outcome.ALL if decoded_outcome[1].upper() == "ALL" else Outcome.SOME if decoded_outcome[1].upper() == "SOME" else Outcome.NONE,
+    )
+
+    log.info(f"\u2705 Normalized Outcome: {normalized_outcome}")
+
+    # Step 2: Set clause size
+    #solver.update_number_of_literals(clause_size)
+    #stats.update_num_literals(clause_size)
+    current_rules = None
+
+
+    solver.update_number_of_literals(clause_size)
+    stats.update_num_literals(clause_size)
+ 
+    with stats.duration("generate"):
+        model = solver.get_model()
+        if not model:
+            log.warning("No model after constraints. Will increase clause size next round.")
+            return [np.array([], dtype="<U100")], stats, current_min_clause, current_before, clause_size + 1
+
+        current_rules, before, min_clause = generate_program(model)
+        current_before = before
+        current_min_clause = min_clause
+        stats.register_hypothesis(current_rules)
+
+    if normalized_outcome == (Outcome.ALL, Outcome.NONE):
+        stats.register_best_hypothesis(current_rules)
+        stats.register_completion()
+        rule_bytes = [Clause.to_code(rule) for rule in current_rules]
+        return [np.array(rule_bytes, dtype="<U100")], stats, current_min_clause, current_before, clause_size
+
+    with stats.duration("build"):
+        constraints = build_rules(settings, stats, constrainer, tester, current_rules, current_before, current_min_clause, normalized_outcome)
+        log.debug(f"📭 Constraints generated: {constraints}")
+    
+    if not constraints:
+        log.warning("No constraints generated. Will retry next round.")
+        return [np.array(rule_bytes, dtype="<U100")], stats, current_min_clause, current_before, clause_size + 1
+
+    with stats.duration("ground"):
+        grounded_constraints = ground_rules(stats, grounder, solver.max_clauses, solver.max_vars, constraints)
+
+    with stats.duration("add"):
+        solver.add_ground_clauses(grounded_constraints)
+
+    rule_bytes = [Clause.to_code(rule) for rule in current_rules]
+    return [np.array(rule_bytes, dtype="<U100")], stats, current_min_clause, current_before, clause_size
+
+def aggregate_popper(outcome_list: List[Tuple[int, int]], settings, solver, grounder, constrainer,tester, stats, current_hypothesis, current_min_clause, current_before, clause_size):
     """
     Aggregate constraints based on outcome pairs (E+, E-), generate new constraints,
     and then use them to generate a new hypothesis (rules).
@@ -173,29 +325,20 @@ def aggregate_popper(outcome_list: List[Tuple[int, int]], settings, solver, stat
     
     log.info(f"✅ Final Aggregated Outcome: {normalized_outcome}")
 
-    #stats = Stats(log_best_programs=settings.info)
-
-    # ✅ Step 3: Load Knowledge Base
-    kbpath = "trains"
-    _, _, bias_file = load_kbpath(kbpath)
     
-    # ✅ Step 4: Initialize ILP Components
-    #settings = Settings(bias_file, "","")
-    tester = Tester(settings)
-    constrainer = Constrain()
-    grounder = ClingoGrounder()
-   
-    # ✅ Step 8: Restore `before` and `min_clause`
-    #before = current_before if current_before else {tuple(rule): set() for rule in current_rules}
-    #min_clause = current_min_clause if current_min_clause else {tuple(rule): 1 for rule in current_rules}
-    conf_matrix= (0,0,0,0)
     if current_hypothesis is None: 
         log.debug("Generate new first hypothesis")
+        solver.update_number_of_literals(clause_size)
+        stats.update_num_literals(clause_size)
     # Generate Hypothesis 
         with stats.duration('generate'):
             model = solver.get_model()
             if not model:
-                log(WARNING,"No model in solver")
+                log.debug("No model in solver")
+                clause_size += 1
+                empty_rule_array = np.array([], dtype="<U100")
+                return [empty_rule_array], stats, current_min_clause, current_before, clause_size
+            
             (current_rules, before, min_clause) = generate_program(model)
             current_hypothesis = current_rules
             current_before = before
@@ -216,27 +359,23 @@ def aggregate_popper(outcome_list: List[Tuple[int, int]], settings, solver, stat
         except Exception as e:
             log.error(f"❌ Error processing received rules: {e}")
             current_rules = []  # Reset to empty if parsing fails
-        #if isinstance(current_hypothesis, np.ndarray):  
-        #    current_hypothesis = current_hypothesis.flatten().tolist() # Convert ndarray to list of strings 
-        #elif isinstance(current_hypothesis, list) and isinstance(current_hypothesis[0], np.ndarray):  
-        #    current_hypothesis = [str(rule) for arr in current_hypothesis for rule in arr] # Handle nested arrays   
-        
-        
+
     log.debug(f"🔍 Rules before applying constraints: {current_rules}")     
-    
-
-    before = current_before if current_before else {rule: set() for rule in current_rules} 
-
-    min_clause = current_min_clause if current_min_clause else {rule: 1 for rule in current_rules} 
+     
     
     log.info(f"🔹 Normalized Outcome: {normalized_outcome}")
 
     if normalized_outcome == (Outcome.ALL, Outcome.NONE):
+        print(" /!\ /!\ /!\ /!\ /!\ /!\ /!\ /!\ /!\ /!\ /!\ /!\ /!\ ")
+        print(" ")
+        print(normalized_outcome)
+        print(" ")
+        print(" /!\ /!\ /!\ /!\ /!\ /!\ /!\ /!\ /!\ /!\ /!\ /!\ /!\ ")
         log.debug("get_out_rounds, we okay")
         stats.register_best_hypothesis(current_rules)
         new_rules_bytes = [Clause.to_code(rule) for rule in current_rules]
         new_rules_ndarray = np.array(new_rules_bytes, dtype="<U100")
-        return [new_rules_ndarray], solver, stats, current_min_clause, current_before
+        return [new_rules_ndarray], stats, current_min_clause, current_before, clause_size
     
 
     # ✅ Step 7: Generate Constraints with Stats Tracking
@@ -244,25 +383,6 @@ def aggregate_popper(outcome_list: List[Tuple[int, int]], settings, solver, stat
         constraints = build_rules(settings, stats, constrainer, tester, current_rules, current_before, current_min_clause, normalized_outcome)
 
     log.debug(f"🔍 Generated Constraints: {constraints}")
-
-    proper_constraints = set()
-
-    for head, body in constraints:
-        # Convert head if it's not None
-        if head is None:
-            head_lit = None  # No head for some constraints
-        else:
-            head_lit = Literal(head.predicate, head.arguments)  # Convert tuple back to Literal
-
-        # Convert each body item back to Literal and store as frozenset
-        body_lits = frozenset(Literal(lit.predicate, lit.arguments) for lit in body)
-
-        # ✅ Store as a tuple with a frozenset to be hashable
-        proper_constraints.add((head_lit, body_lits))
-
-    # ✅ Step 8: Apply Constraints & Generate New Rules
-
-    log.debug(f"🔍 Constraints BEFORE grounding: {proper_constraints}")
 
     with stats.duration('ground'):
         grounded_constraints = ground_rules(stats, grounder, solver.max_clauses, solver.max_vars, constraints)
@@ -273,6 +393,14 @@ def aggregate_popper(outcome_list: List[Tuple[int, int]], settings, solver, stat
     
 
     with stats.duration('generate'):
+        model = solver.get_model()
+        if not model: 
+            log.warning("No model generated after constraints in solver")
+            rule_bytes = [Clause.to_code(rule) for rule in current_rules]
+            rule_ndarray = np.array(rule_bytes, dtype="<U100")
+            clause_size += 1
+            return [rule_ndarray], stats, current_min_clause, current_before, clause_size
+
         current_rules, before, min_clause = generate_program(solver.get_model())
         current_before = before
         current_min_clause = min_clause
@@ -283,7 +411,7 @@ def aggregate_popper(outcome_list: List[Tuple[int, int]], settings, solver, stat
 
     log.info(f"🚀 Sending {len(new_rules_ndarray)} rules to clients.")
 
-    return [new_rules_ndarray], solver, stats, current_min_clause, current_before
+    return [new_rules_ndarray], stats, current_min_clause, current_before, clause_size
 
 
 def aggregate(results: List[Tuple[NDArrays, int]]) -> NDArrays:

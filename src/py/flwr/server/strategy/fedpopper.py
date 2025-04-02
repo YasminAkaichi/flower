@@ -35,11 +35,13 @@ class FedPopper(Strategy):
         settings: None,
         current_hypothesis = None,
         current_before = None,
-        current_min_clause = None,
+        current_min_clause = 1,
+        current_clause_size= 0, 
         stats = None,
         solver = None,
         grounder = None,
         constrainer = None,
+        tester = None,
         fraction_fit: float = 1.0,
         fraction_evaluate: float = 1.0,
         min_fit_clients: int = 2,
@@ -60,10 +62,12 @@ class FedPopper(Strategy):
         self.current_hypothesis = current_hypothesis
         self.current_before = current_before
         self.current_min_clause = current_min_clause
+        self.current_clause_size = current_clause_size
         self.solver = solver
         self.grounder = grounder
         self.constrainer = constrainer
-        self.stats = stats if stats else Stats(log_best_programs = True)
+        self.tester = tester
+        self.stats = stats 
     def __repr__(self) -> str:
         return "FedConstraints"
     
@@ -121,21 +125,31 @@ class FedPopper(Strategy):
             (parameters_to_ndarrays(fit_res.parameters), fit_res.num_examples)
             for _, fit_res in results
         ]
-        
+        clause_size = min(server_round, self.settings.max_literals)
+
+        if clause_size > self.current_clause_size: 
+            self.solver.update_number_of_literals(clause_size)
+            self.stats.update_num_literals(clause_size)
+            self.current_clause_size = clause_size
+            #log(DEBUG,f"✅ Solver updated to clause size: {clause_size}")
+        #else:
+            #log(DEBUG,f"⏩ Solver NOT updated (current: {self.current_clause_size}, requested: {clause_size})")
+
+           
         log(DEBUG, f"Received encoded outcomes from clients: {outcome_results}")
         # ✅ Step 2: Aggregate outcomes and generate new rules
-        new_rules, solver, stats, min_clause, before = aggregate_popper(outcome_results, self.settings, self.solver, self.stats,self.current_hypothesis,self.current_min_clause, self.current_before)
+        new_rules, stats, min_clause, before, clause_size = aggregate_popper(outcome_results, self.settings, self.solver, self.grounder, self.constrainer, self.tester, self.stats,self.current_hypothesis,self.current_min_clause, self.current_before, self.current_clause_size)
         # ✅ Store the hypothesis for the next round
+        #self.current_clause_size = clause_size
+        self.stats = stats
         if new_rules and len(new_rules[0]) > 0:
             self.current_hypothesis = new_rules
             self.current_before = before
             self.current_min_clause = min_clause
             #self.stats = updated_stats
             log(DEBUG,"✅ Updated current hypothesis and constraints for next round.")
-        if solver and stats:
-            self.stats = stats
-            log(DEBUG,"✅ Updated current stats and solver for next round.")
-    
+
+        self.stats.register_completion()
         #log(DEBUG, f"Generated hypothesis (new rules) from constraints: {new_rules}")
 
         new_rules_ndarray = np.array(new_rules, dtype="<U100")
