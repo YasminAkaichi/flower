@@ -23,7 +23,6 @@ from andante.program import AndanteProgram
 from andante.solver import AndanteSolver
 from andante.parser import Parser
 from andante.collections import OrderedSet
-import flwr.common.ilphelper as helper
 
 class FedILP(Strategy):
     def __init__(

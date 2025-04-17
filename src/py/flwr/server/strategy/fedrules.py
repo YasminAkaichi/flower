@@ -16,7 +16,7 @@ from flwr.common import (
 from dataclasses import dataclass
 from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
-from flwr.server.strategy.aggregate import aggregate, weighted_loss_avg, aggregate_popper
+from flwr.server.strategy.aggregate import aggregate, weighted_loss_avg, aggregate_rules
 from .strategy import Strategy
 from collections import OrderedDict
 from popper.util import Settings
@@ -30,20 +30,10 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class FedPopper(Strategy):
+class FedRules(Strategy):
     def __init__(
         self,
-        settings: None,
         current_hypothesis = None,
-        current_before = None,
-        current_min_clause = 0,
-        current_clause_size= 0, 
-        stats = None,
-        solver = None,
-        grounder = None,
-        constrainer = None,
-        tester = None,
-        seen_prog = None,
         fraction_fit: float = 1.0,
         fraction_evaluate: float = 1.0,
         min_fit_clients: int = 2,
@@ -53,7 +43,6 @@ class FedPopper(Strategy):
         fit_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
     ) -> None:
         super().__init__()
-        self.settings = settings
         self.fraction_fit = fraction_fit
         self.fraction_evaluate = fraction_evaluate
         self.min_fit_clients = min_fit_clients
@@ -62,15 +51,6 @@ class FedPopper(Strategy):
         self.initial_parameters = initial_parameters
         self.fit_metrics_aggregation_fn = fit_metrics_aggregation_fn
         self.current_hypothesis = current_hypothesis
-        self.current_before = current_before
-        self.current_min_clause = current_min_clause
-        self.current_clause_size = current_clause_size
-        self.solver = solver
-        self.grounder = grounder
-        self.constrainer = constrainer
-        self.tester = tester
-        self.seen_prog = seen_prog
-        self.stats = stats 
     def __repr__(self) -> str:
         return "FedConstraints"
     
@@ -123,55 +103,22 @@ class FedPopper(Strategy):
     ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
         """Aggregate fit results using the ILP aggregation method."""
         
+        raw_results= []
         # ✅ Step 1: Extract outcome pairs (E+, E-) and number of examples
-        outcome_results = [
+        
+        results = [
             (parameters_to_ndarrays(fit_res.parameters), fit_res.num_examples)
             for _, fit_res in results
         ]
-        log(DEBUG, f"Received encoded outcomes from clients: {outcome_results}")
-        # ✅ Step 2: Aggregate outcomes and generate new rules
-        self.current_clause_size += 1
-        self.solver.update_number_of_literals(self.current_clause_size)
-        self.stats.update_num_literals(self.current_clause_size)
-        new_rules, min_clause, before, clause_size, solver = aggregate_popper(
-            outcome_results, 
-            self.settings,
-            self.solver, 
-            self.grounder, 
-            self.constrainer, 
-            self.tester,
-            self.stats, 
-            self.current_min_clause, 
-            self.current_before,  
-            self.current_hypothesis,  
-            self.current_clause_size)
-   
-        self.solver.update_number_of_literals(self.current_clause_size)
         
-        if new_rules and len(new_rules[0]) > 0:
-            self.current_hypothesis = new_rules
-            self.current_before = before
-            self.current_min_clause = min_clause
-            self.current_clause_size = clause_size
-            #self.stats = updated_stats
-            log(DEBUG,"✅ Updated current hypothesis and constraints for next round.")
-
-        #log(DEBUG, f"Generated hypothesis (new rules) from constraints: {new_rules}")
+        new_rules = aggregate_rules(results)
 
         new_rules_ndarray = np.array(new_rules, dtype="<U1000")
 
         # ✅ Step 3: Convert rules to Flower parameters
         parameters_aggregated = ndarrays_to_parameters(new_rules_ndarray)
 
-        # ✅ Step 4: Aggregate custom metrics if provided
-        metrics_aggregated = {}
-        if self.fit_metrics_aggregation_fn:
-            fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
-            metrics_aggregated = self.fit_metrics_aggregation_fn(fit_metrics)
-        elif server_round == 1:
-            log(WARNING, "No fit_metrics_aggregation_fn provided")
-
-        return parameters_aggregated, metrics_aggregated
+        return parameters_aggregated, {}
     
 
     def configure_evaluate(
