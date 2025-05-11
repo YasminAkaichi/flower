@@ -30,6 +30,8 @@ from popper.loop import Outcome, build_rules, decide_outcome, ground_rules, Con,
 from clingo import Function, Number, String
 from typing import List, Tuple, Dict
 from collections import OrderedDict
+
+from sklearn.tree import DecisionTreeClassifier, export_text
 import re 
 # 🔹 Logging Setup
 logging.basicConfig(level=logging.DEBUG)
@@ -489,6 +491,15 @@ def aggregate(results: List[Tuple[NDArrays, int]]) -> NDArrays:
     ]
     return weights_prime
 
+def _parse_tree_from_string(tree_str: str) -> DecisionTreeClassifier:
+        used_features = set(int(match) for match in re.findall(r"x(\d+)", tree_str))
+        max_feature = max(used_features) if used_features else 0
+
+        X_fake = np.random.randint(0, 2, size=(100, max_feature + 1))
+        y_fake = np.random.randint(0, 2, size=(100,))
+        clf = DecisionTreeClassifier(max_depth=5, random_state=0)
+        clf.fit(X_fake, y_fake)
+        return clf
 
 
 
