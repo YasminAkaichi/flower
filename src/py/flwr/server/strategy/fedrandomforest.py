@@ -16,7 +16,7 @@
 
 Paper: arxiv.org/abs/1602.05629
 """
-
+from sklearn.tree import DecisionTreeClassifier, export_text
 from sklearn.ensemble import RandomForestClassifier
 import pickle
 import numpy as np
@@ -224,7 +224,83 @@ class FedRandomForest(Strategy):
         # Return client/config pairs
         return [(client, evaluate_ins) for client in clients]
 
+
+
+
+    def aggregate_fit(self, server_round, results, failures):
+        trees = []
+        print(f"\n🔄 Aggregating round {server_round}")
+
+        for idx, (_, fit_res) in enumerate(results):
+            try:
+                tree_array = parameters_to_ndarrays(fit_res.parameters)[0]
+                tree_bytes = tree_array.tobytes()
+                payload = pickle.loads(tree_bytes)
+
+                # ✅ Extraire uniquement le modèle
+                model = payload["model"]
+                acc = fit_res.metrics.get("local_train_acc", 0.0)
+                print(f"📊 Client {idx} accuracy: {acc:.4f}")
+
+                if isinstance(model, DecisionTreeClassifier):
+                    trees.append(model)
+                    print(f"✅ Arbre du client {idx} conservé (acc={acc:.2f})")
+
+                    # 🔍 Affichage de l’arbre local
+                    feature_names = [f"x{i}" for i in range(model.n_features_in_)]
+                    print(f"\n🌲 Arbre reçu du client {idx} :")
+                    print(export_text(model, feature_names=feature_names))
+
+                elif isinstance(model, RandomForestClassifier):
+                    print(f"📦 Client {idx} a envoyé une forêt. Extraction des arbres internes...")
+                    for j, tree in enumerate(model.estimators_):
+                        trees.append(tree)
+                        feature_names = [f"x{i}" for i in range(tree.n_features_in_)]
+                        print(f"\n🌳 Arbre {j+1} du client {idx} :")
+                        print(export_text(tree, feature_names=feature_names))
+
+            except Exception as e:
+                print(f"⚠️ Erreur lors du traitement de l'arbre du client {idx}: {e}")
+
+        print(f"\n✅ Total des arbres conservés : {len(trees)}")
+
+        if not trees:
+            print("❌ Aucun arbre valide reçu. On retourne un modèle vide.")
+            return ndarrays_to_parameters([]), {}
+
+        # ✅ Création du modèle agrégé
+        rf = RandomForestClassifier(n_estimators=len(trees))
+        rf.estimators_ = trees
+        rf.classes_ = np.unique(np.concatenate([tree.classes_ for tree in trees]))
+        rf.n_classes_ = len(rf.classes_)
+
+        print("\n🌲 Random Forest agrégée finale :")
+        for i, tree in enumerate(rf.estimators_):
+            feature_names = [f"x{j}" for j in range(tree.n_features_in_)]
+            print(f"\n🧩 Arbre {i+1} :\n{export_text(tree, feature_names=feature_names)}")
+
+        rf_bytes = pickle.dumps(rf)
+        rf_array = np.frombuffer(rf_bytes, dtype=np.uint8)
+        return ndarrays_to_parameters([rf_array]), {}
+
+
+
+
+
+    """
+
+    def fit(self, parameters, config):
+        self.model.fit(self.X_train, self.y_train)
+        # 🎯 Évaluer la performance locale juste après le training
+        y_pred_train = self.model.predict(self.X_train)
+        local_train_acc = accuracy_score(self.y_train, y_pred_train)
+        print(f"\n📈 [Client] Accuracy locale sur le jeu d'entraînement : {local_train_acc:.4f}")
     
+        feature_names = [f"x{i}" for i in range(self.model.n_features_in_)]
+        tree_str = export_text(self.model, feature_names=feature_names)
+        print("\n[INFO] Arbre local appris par le client :")
+        print(tree_str)
+        return [np.array([tree_str], dtype="<U1000")], len(self.X_train), {}
     def aggregate_fit(self, server_round, results, failures):
         trees = []
         print(f"\n🔄 Aggregating round {server_round}")
@@ -265,7 +341,7 @@ class FedRandomForest(Strategy):
         rf_array = np.frombuffer(rf_bytes, dtype=np.uint8)
         return ndarrays_to_parameters([rf_array]), {}
 
-
+   """
     
 
     def aggregate_evaluate(

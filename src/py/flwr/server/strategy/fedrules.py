@@ -16,12 +16,11 @@ from flwr.common import (
 from dataclasses import dataclass
 from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
-from flwr.server.strategy.aggregate import aggregate, weighted_loss_avg, aggregate_rules
+from flwr.server.strategy.aggregate import aggregate, weighted_loss_avg, aggregate_rules, aggregate_ilp
 from .strategy import Strategy
 from collections import OrderedDict
 from popper.util import Settings
 from popper.tester import Tester
-from popper.core import Clause
 from popper.util import Settings, Stats
 from logging import DEBUG
 import logging
@@ -111,7 +110,7 @@ class FedRules(Strategy):
             for _, fit_res in results
         ]
         
-        new_rules = aggregate_rules(results)
+        new_rules = aggregate_ilp(results)
 
         new_rules_ndarray = np.array(new_rules, dtype="<U1000")
 

@@ -13,21 +13,21 @@ from typing import List, Tuple
 from functools import reduce
 from flwr.common import NDArrays
 from typing import List, Tuple
-from popper.asp import ClingoGrounder, ClingoSolver
-from popper.loop import build_rules, ground_rules
-from popper.constrain import Constrain
-from popper.generate import generate_program
+#from popper.asp import ClingoGrounder, ClingoSolver
+#from popper.loop import build_rules, ground_rules
+#from popper.constrain import Constrain
+#from popper.generate import generate_program
 from logging import DEBUG 
 from collections import Counter
-from popper.util import Stats
+#from popper.util import Stats
 import logging
-from popper.tester import Tester
-from popper.constrain import Constrain
-from popper.core import Clause, Literal, ConstVar
-from popper.asp import ClingoGrounder, ClingoSolver
-from popper.util import load_kbpath, parse_settings,  Settings, Stats
-from popper.loop import Outcome, build_rules, decide_outcome, ground_rules, Con,calc_score
-from clingo import Function, Number, String
+#from popper.tester import Tester
+#from popper.constrain import Constrain
+#from popper.core import Clause, Literal, ConstVar
+#from popper.asp import ClingoGrounder, ClingoSolver
+#from popper.util import load_kbpath, parse_settings,  Settings, Stats
+#from popper.loop import Outcome, build_rules, decide_outcome, ground_rules, Con,calc_score
+#from clingo import Function, Number, String
 from typing import List, Tuple, Dict
 from collections import OrderedDict
 
@@ -91,7 +91,7 @@ def aggregate_outcomes(outcomes: List[Tuple[str, str]]) -> Tuple[str, str]:
 
     return (aggregated_E_plus, aggregated_E_minus)
 
-
+"""
 def transform_rule_to_tester_format(rule_str):
     log.debug(f"🔍 Transforming rule: {rule_str}")
 
@@ -137,10 +137,10 @@ def aggregate_popperWhile(
         current_before, 
         current_hypothesis, 
         clause_size):
-    """
+    
     Aggregate constraints based on outcome pairs (E+, E-), generate new constraints,
     and then use them to generate a new hypothesis (rules).
-    """
+    
     log.info(f"Received Outcomes: {outcome_list}")
     
     # ✅ Step 1: Aggregate Outcomes
@@ -227,10 +227,10 @@ def aggregate_popperWhile(
 
 
 def aggregate_popper(outcome_list: List[Tuple[int, int]], settings, solver, grounder, constrainer,tester, stats, current_min_clause, current_before, current_hypothesis, clause_size):
-    """
+    
     Aggregate constraints based on outcome pairs (E+, E-), generate new constraints,
     and then use them to generate a new hypothesis (rules).
-    """
+    
     log.info(f"Received Outcomes: {outcome_list}")
     
     # ✅ Step 1: Aggregate Outcomes
@@ -320,10 +320,8 @@ def aggregate_popper(outcome_list: List[Tuple[int, int]], settings, solver, grou
 
     return [new_rules_ndarray], current_min_clause, current_before, clause_size, solver
 
-
-
 def aggregate_rulesx(results: List[Tuple[List[np.ndarray], int]]) -> List[np.ndarray]:
-    """
+    
     Aggregate rules by converting to tester format (Prolog style), deduplicating structurally.
     
     Args:
@@ -331,7 +329,7 @@ def aggregate_rulesx(results: List[Tuple[List[np.ndarray], int]]) -> List[np.nda
 
     Returns:
         Deduplicated list of rules as a NumPy array.
-    """
+    
     unique_rules = set()
 
     for rule_arrays, _ in results:
@@ -347,7 +345,7 @@ def aggregate_rulesx(results: List[Tuple[List[np.ndarray], int]]) -> List[np.nda
     aggregated_ndarray = np.array(deduped_rules_str, dtype='<U1000')
     #return [np.array(deduped_rules_str, dtype="<U1000")]
     return aggregated_ndarray
-    
+"""
 
 def aggregate_rules(results: List[Tuple[List[np.ndarray], int]]) -> List[np.ndarray]:
     """
@@ -371,7 +369,6 @@ def aggregate_rules(results: List[Tuple[List[np.ndarray], int]]) -> List[np.ndar
             log.info(f"  ➤ {rule}")
             all_rules.add(rule)  # Set handles deduplication automatically
 
-
     log.info(f"✅ Total unique rules after aggregation: {len(all_rules)}")
     return [np.array(list(all_rules), dtype="<U1000")]
 
@@ -382,12 +379,12 @@ def encode_hypotheses_for_flower(hypotheses: List[List[str]]) -> List[np.ndarray
         flat_rules.extend(hyp)
         flat_rules.append("### HYP ###")  # Séparateur
     return [np.array(flat_rules, dtype="<U1000")]    
-"""
-def aggregate_ilp(results: List[Tuple[List[np.ndarray], int]]) -> List[np.ndarray]:
-    
+
+def aggregate_ilpx(results: List[Tuple[List[np.ndarray], int]]) -> List[np.ndarray]:
+    """
     Aggregate rules from all clients using OrderedSet union.
     Removes duplicates and keeps order. Logs everything cleanly.
-    
+    """
     aggregated_set = OrderedSet()
 
     log.info("📦 Aggregating rules from clients...")
@@ -415,7 +412,7 @@ def aggregate_ilp(results: List[Tuple[List[np.ndarray], int]]) -> List[np.ndarra
 
     # Convert back to np.ndarray
     return [np.array(list(aggregated_set), dtype="<U1000")]
-"""
+
 
 def aggregate_ilp(results: List[Tuple[List[np.ndarray], int]]) -> List[np.ndarray]:
     """
@@ -458,13 +455,13 @@ def aggregate_ilp(results: List[Tuple[List[np.ndarray], int]]) -> List[np.ndarra
         all_hypotheses.extend(client_hypotheses)
 
     # Optional: add union of all hypotheses as global hypothesis HG
-    all_rules = OrderedSet()
-    for hyp in all_hypotheses:
-        all_rules |= OrderedSet(hyp)
+    #all_rules = OrderedSet()
+    #for hyp in all_hypotheses:
+    #    all_rules |= OrderedSet(hyp)
 
-    HG = list(all_rules)
-    all_hypotheses.append(HG)
-    log.info(f"✅ Added global hypothesis HG with {len(HG)} unique rules")
+    #HG = list(all_rules)
+    #all_hypotheses.append(HG)
+    #log.info(f"✅ Added global hypothesis HG with {len(HG)} unique rules")
 
     # Flatten all hypotheses and add separator
     flat_list = []
