@@ -30,6 +30,18 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+class DummyTester:
+    def check_redundant_literal(self, program):
+        return []
+    def check_redundant_clause(self, program):
+        return False
+    def is_non_functional(self, program):
+        return False
+    def is_totally_incomplete(self, rule):
+        return False  # car dépend d’exemples
+    def is_inconsistent(self, rule):
+        return False 
+
 class FedPopper(Strategy):
     def __init__(
         self,
@@ -68,7 +80,7 @@ class FedPopper(Strategy):
         self.solver = solver
         self.grounder = grounder
         self.constrainer = constrainer
-        self.tester = tester
+        self.tester = DummyTester()
         self.seen_prog = seen_prog
         self.stats = stats 
     def __repr__(self) -> str:
