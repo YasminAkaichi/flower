@@ -21,6 +21,8 @@ from .strategy import Strategy
 from collections import OrderedDict
 from popper.util import Settings
 from popper.tester import Tester
+
+from popper.dummy_tester import DummyTester
 from popper.core import Clause
 from popper.util import Settings, Stats
 from logging import DEBUG
@@ -29,18 +31,9 @@ import ast
 import numpy as np 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-class DummyTester:
-    def check_redundant_literal(self, program):
-        return []
-    def check_redundant_clause(self, program):
-        return False
-    def is_non_functional(self, program):
-        return False
-    def is_totally_incomplete(self, rule):
-        return False  # car dépend d’exemples
-    def is_inconsistent(self, rule):
-        return False 
+from flwr.server.strategy.aggregate import aggregate_outcomes  # tu l’as déjà
+# si besoin local:
+DECODE = {1: "all", 2: "some", 3: "none"}
 
 class FedPopper(Strategy):
     def __init__(
@@ -63,6 +56,7 @@ class FedPopper(Strategy):
         min_available_clients: int = 2,
         initial_parameters: Optional[Parameters] = None,
         fit_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
+        
     ) -> None:
         super().__init__()
         self.settings = settings
@@ -83,6 +77,8 @@ class FedPopper(Strategy):
         self.tester = DummyTester()
         self.seen_prog = seen_prog
         self.stats = stats 
+        self.solution_params: Optional[Parameters] = None
+        self.early_stop = False
     def __repr__(self) -> str:
         return "FedConstraints"
     
@@ -100,32 +96,43 @@ class FedPopper(Strategy):
         return self.initial_parameters
 
     def configure_fit(
-        self, server_round: int, parameters: Parameters, client_manager: ClientManager
-    ) -> List[Tuple[ClientProxy, FitIns]]:
+    self, server_round: int, parameters: Parameters, client_manager: ClientManager
+) -> List[Tuple[ClientProxy, FitIns]]:
         """Configure the next round of training."""
 
-        # Sample clients
+        # ✅ EARLY STOPPING CHECK
+        if getattr(self, "early_stop", False):
+            log(DEBUG, f"⏹️ Early stop triggered at round {server_round}: no more fit() calls.")
+            return []   # -> Means no more clients will be trained
+
+        # ✅ Normal behavior if not early-stopped
         sample_size, min_num_clients = self.num_fit_clients(
             client_manager.num_available()
         )
         clients = client_manager.sample(
-            num_clients=sample_size, min_num_clients=min_num_clients
+            num_clients=sample_size,
+            min_num_clients=min_num_clients
         )
 
-        # Create custom configs
+        # Your lr-splitting logic
         n_clients = len(clients)
         half_clients = n_clients // 2
         standard_config = {"lr": 0.001}
         higher_lr_config = {"lr": 0.003}
+
         fit_configurations = []
         for idx, client in enumerate(clients):
             if idx < half_clients:
-                fit_configurations.append((client, FitIns(parameters, standard_config)))
+                fit_configurations.append(
+                    (client, FitIns(parameters, standard_config))
+                )
             else:
                 fit_configurations.append(
                     (client, FitIns(parameters, higher_lr_config))
                 )
+
         return fit_configurations
+
 
     def aggregate_fit(
         self,
@@ -140,12 +147,21 @@ class FedPopper(Strategy):
             (parameters_to_ndarrays(fit_res.parameters), fit_res.num_examples)
             for _, fit_res in results
         ]
+
         log(DEBUG, f"Received encoded outcomes from clients: {outcome_results}")
+
+        # 2) (optionnel) re-calculer l’outcome global (encoded -> str)
+
+        encoded = [tuple(arr[0].tolist()) for arr, _ in outcome_results]  # p.ex. [(3,3), (1,2)]
+        # sécurité: convertir numpy.int64 -> int -> 'all/some/none'
+        decoded = [(DECODE[int(a)], DECODE[int(b)]) for (a, b) in encoded]
+        eplus_glob, eminus_glob = aggregate_outcomes(decoded)
+
         # ✅ Step 2: Aggregate outcomes and generate new rules
         self.current_clause_size += 1
         self.solver.update_number_of_literals(self.current_clause_size)
         self.stats.update_num_literals(self.current_clause_size)
-        new_rules, min_clause, before, clause_size, solver = aggregate_popper(
+        new_rules, min_clause, before, clause_size, solver, solved = aggregate_popper(
             outcome_results, 
             self.settings,
             self.solver, 
@@ -159,7 +175,10 @@ class FedPopper(Strategy):
             self.current_clause_size)
    
         self.solver.update_number_of_literals(self.current_clause_size)
-        
+        if solved:
+            self.early_stop = True
+            log(DEBUG, "✅ Early stop activated: global outcome is (ALL, NONE).")
+
         if new_rules and len(new_rules[0]) > 0:
             self.current_hypothesis = new_rules
             self.current_before = before
@@ -169,11 +188,42 @@ class FedPopper(Strategy):
             log(DEBUG,"✅ Updated current hypothesis and constraints for next round.")
 
         #log(DEBUG, f"Generated hypothesis (new rules) from constraints: {new_rules}")
+        # ✅ If no new rules were generated, keep the previous hypothesis
+        def _ensure_ndarrays(rules):
+            # cas None
+            if rules is None:
+                return [np.array([], dtype="<U1000")]
+            # déjà la bonne forme -> [ndarray, ...]
+            if isinstance(rules, list) and len(rules) > 0 and isinstance(rules[0], np.ndarray):
+                return rules
+            # liste vide
+            if isinstance(rules, list) and len(rules) == 0:
+                return [np.array([], dtype="<U1000")]
+            # liste de strings -> un seul ndarray
+            if isinstance(rules, list) and len(rules) > 0 and isinstance(rules[0], str):
+                return [np.array(rules, dtype="<U1000")]
+            # ndarray seul
+            if isinstance(rules, np.ndarray):
+                # 0-D ou vide -> liste avec ndarray vide
+                if rules.ndim == 0 or rules.size == 0:
+                    return [np.array([], dtype="<U1000")]
+                return [rules]
+            # fallback sûr
+            return [np.array([], dtype="<U1000")]
 
-        new_rules_ndarray = np.array(new_rules, dtype="<U1000")
+        # garder l’ancienne hypothèse si rien de nouveau
+        if not new_rules or (isinstance(new_rules, list) and len(new_rules) > 0 and isinstance(new_rules[0], np.ndarray) and len(new_rules[0]) == 0):
+            new_rules = self.current_hypothesis
 
+        new_rules_ndarrays = _ensure_ndarrays(new_rules)
+        parameters_aggregated = ndarrays_to_parameters(new_rules_ndarrays)
+                
         # ✅ Step 3: Convert rules to Flower parameters
-        parameters_aggregated = ndarrays_to_parameters(new_rules_ndarray)
+        #parameters_aggregated = ndarrays_to_parameters(new_rules_ndarray)
+        
+        # ✅ 4) Si l’outcome global est (ALL,NONE), mémoriser ces paramètres comme “règle finale”
+        if (eplus_glob, eminus_glob) == ("all", "none"):
+            self.solution_params = parameters_aggregated  # 🔒 garde la solution pour l’évaluation
 
         # ✅ Step 4: Aggregate custom metrics if provided
         metrics_aggregated = {}
@@ -187,23 +237,32 @@ class FedPopper(Strategy):
     
 
     def configure_evaluate(
-        self, server_round: int, parameters: Parameters, client_manager: ClientManager
-    ) -> List[Tuple[ClientProxy, EvaluateIns]]:
+    self, server_round: int, parameters: Parameters, client_manager: ClientManager
+) -> List[Tuple[ClientProxy, EvaluateIns]]:
+
         """Configure the next round of evaluation."""
+
+        # ✅ EARLY STOP: If the final program was found, we evaluate ONCE then stop.
+        if getattr(self, "early_stop", False):
+            log.debug(f"⏹️ Early stop is active at round {server_round}: skipping evaluation.")
+            return []
+
         if self.fraction_evaluate == 0.0:
             return []
+
+        # ✅ Use final hypothesis if discovered, otherwise use current parameters
+        params_for_eval = self.solution_params if self.solution_params is not None else parameters
+
         config = {}
-        evaluate_ins = EvaluateIns(parameters, config)
+        evaluate_ins = EvaluateIns(params_for_eval, config)
 
         # Sample clients
-        sample_size, min_num_clients = self.num_evaluation_clients(
-            client_manager.num_available()
-        )
+        sample_size, min_num_clients = self.num_evaluation_clients(client_manager.num_available())
         clients = client_manager.sample(
-            num_clients=sample_size, min_num_clients=min_num_clients
+            num_clients=sample_size,
+            min_num_clients=min_num_clients
         )
 
-        # Return client/config pairs
         return [(client, evaluate_ins) for client in clients]
 
     def aggregate_evaluate(

@@ -37,9 +37,11 @@ import re
 logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger(__name__)
 
-OUTCOME_ENCODING = {"ALL": 1, "SOME": 2, "NONE": 3}
-OUTCOME_DECODING = {1: "ALL", 2: "SOME", 3: "NONE"}
-
+#OUTCOME_ENCODING = {"ALL": 1, "SOME": 2, "NONE": 3}
+#OUTCOME_DECODING = {1: "ALL", 2: "SOME", 3: "NONE"}
+# en haut du fichier aggregate.py (si pas déjà défini)
+OUTCOME_ENCODING = {"all": 1, "some": 2, "none": 3}
+OUTCOME_DECODING = {1: "all", 2: "some", 3: "none"}
 
 
 
@@ -67,33 +69,34 @@ def _norm(o):
     else:
         return str(o).lower()
 
-def aggregate_outcomes(outcomes):
+def aggregate_outcomes_old(outcomes):
     """
-    outcomes: liste de paires soit (str,str) soit (int,int) encodées
-    Retourne ('all'|'some'|'none', 'some'|'none')
+    outcomes : list of numpy arrays or tuples like (3,3)
+    RETURNS: tuple of ints (1..3)
     """
-    outs = [(_norm(a), _norm(b)) for (a, b) in outcomes if (a is not None and b is not None)]
-    if not outs:
-        return ("none", "none")
+    parsed = [tuple(int(x) for x in o) for o in outcomes]
 
-    eplus_vals  = [a for (a, _) in outs]
-    eminus_vals = [b for (_, b) in outs]
+    # start with first outcome
+    agg_plus, agg_minus = parsed[0]
 
-    # e+ : all=ALL si tous ALL ; all=NONE si tous NONE ; sinon SOME
-    if all(x == "all" for x in eplus_vals):
-        eplus_global = "all"
-    elif all(x == "none" for x in eplus_vals):
-        eplus_global = "none"
-    else:
-        eplus_global = "some"
+    for e_plus, e_minus in parsed[1:]:
+        # === AGG E+ ===
+        if (agg_plus == 1 and e_plus == 1):
+            agg_plus = 1
+        elif agg_plus == 3 and e_plus == 3:
+            agg_plus = 3
+        else:
+            agg_plus = 2    # SOME
 
-    # e- : all=NONE si tous NONE ; sinon SOME (au moins un SOME)
-    eminus_global = "none" if all(x == "none" for x in eminus_vals) else "some"
+        # === AGG E- === (no ALL allowed)
+        if (agg_minus == 3 and e_minus == 3):
+            agg_minus = 3
+        else:
+            agg_minus = 2
 
-    return (eplus_global, eminus_global)
+    return (agg_plus, agg_minus)
 
-
-def aggregate_outcomes_11_novembre(outcomes: List[Tuple[str, str]]) -> Tuple[str, str]:
+def aggregate_outcomes(outcomes: List[Tuple[str, str]]) -> Tuple[str, str]:
     """
     Agrège une liste de paires d'outcomes (E+, E-) en utilisant des règles spécifiques pour chaque cas.
     
@@ -123,62 +126,60 @@ def aggregate_outcomes_11_novembre(outcomes: List[Tuple[str, str]]) -> Tuple[str
 
     return (aggregated_E_plus, aggregated_E_minus)
 
+
+
 def aggregate_popper(
-    outcome_list: List[Tuple[int, int]],
+    outcome_list,   # List[Tuple[List[np.ndarray], int]] : ex [([array([3,3])], 6), ...]
     settings,
     solver,
     grounder,
     constrainer,
-    tester,      # <- doit être un DummyTester côté serveur
+    tester,      # DummyTester côté serveur
     stats,
     current_min_clause,
     current_before,
     current_hypothesis,
     clause_size,
 ):
-    """Aggregate client outcomes (E+,E-), build constraints, and generate next hypothesis."""
+    """Agrège (E+,E-) renvoyés par les clients (ints ou strings), construit les contraintes, et génère l'hypothèse suivante."""
     log.info(f"Received Outcomes: {outcome_list}")
 
-    # 1) Agrégation des outcomes encodés
-    #outcomes = [out for out, _ in outcome_list]                      # [ [array([e+,e-])], ... ]
-    outs = []
+    # 1) Normaliser en entiers (1=ALL, 2=SOME, 3=NONE) quoi qu'envoient les clients
+    encoded_pairs = []  # List[Tuple[int,int]]
     for (arrs, _n) in outcome_list:
-        arr = arrs[0]                     # ndarray like array([3,3]) or strings
-        if arr.dtype.kind in ("i", "u"):  # encoded ints from clients
+        arr = arrs[0]  # ex: array([3,3]) ou array(['all','none'], dtype='<U1000')
+        # Cas numpy d'entiers non signés/signes
+        if getattr(arr, "dtype", None) is not None and arr.dtype.kind in ("i", "u"):
             epos, eneg = int(arr[0]), int(arr[1])
-            outs.append((
-                OUTCOME_DECODING[epos].lower(),
-                OUTCOME_DECODING[eneg].lower(),
-            ))
-        else:                             # already strings
-            s0, s1 = str(arr[0]).lower(), str(arr[1]).lower()
-            outs.append((s0, s1))
-    outcomes = [out for out, _ in outcome_list] 
-    aggregated = aggregate_outcomes([tuple(o[0]) for o in outcomes]) # -> (e+_glob, e-_glob)
+        else:
+            # Cas strings -> nettoyer/decoder -> encoder
+            epos = OUTCOME_ENCODING[str(arr[0]).strip().lower()]
+            eneg = OUTCOME_ENCODING[str(arr[1]).strip().lower()]
+        encoded_pairs.append((epos, eneg))
 
-    log.info(f"✅ Final Aggregated Outcome (encoded): {aggregated}")
-    pos = aggregated[0]
-    neg = aggregated[1]
+    # 2) Agrégation globale en ENTiers → évite le ValueError
+    epos_id, eneg_id = aggregate_outcomes(encoded_pairs)  # retourne (int,int)
 
-    if neg == 'all':
-        neg = 'some'
-    # 2) Normalisation en Outcome.{ALL,SOME,NONE}
-    #decoded = (
-     #   OUTCOME_DECODING[int(aggregated[0])],
-       # OUTCOME_DECODING[int(aggregated[1])]
-    #)
-    
+    pos_s = OUTCOME_DECODING[epos_id]  # 'all'/'some'/'none'
+    neg_s = OUTCOME_DECODING[eneg_id]
+
+    log.info(f"✅ Final Aggregated Outcome (encoded): ({pos_s}, {neg_s})")
+
+    # (option métier présent chez toi)
+    if neg_s == "all":
+        neg_s = "some"
+
     normalized_outcome = (
-        Outcome.ALL  if pos == 'all'  else Outcome.SOME if pos == 'some' else Outcome.NONE,
-        Outcome.ALL  if neg == 'all'  else Outcome.SOME if neg == 'some' else Outcome.NONE,
+        Outcome.ALL  if pos_s == "all"  else Outcome.SOME if pos_s == "some" else Outcome.NONE,
+        Outcome.ALL  if neg_s == "all"  else Outcome.SOME if neg_s == "some" else Outcome.NONE,
     )
     log.info(f"✅ Final Aggregated Outcome (normalized): {normalized_outcome}")
 
     current_rules = []
 
-    # 3) Boucle de génération/affinage tant que le solver a un modèle
+    # 3) Boucle de génération tant qu'il y a un modèle
     while True:
-        with stats.duration('generate'):
+        with stats.duration("generate"):
             model = solver.get_model()
             if not model:
                 log.debug("No model in solver")
@@ -191,24 +192,24 @@ def aggregate_popper(
 
             log.debug(f"🔍 Candidate rules: {current_rules}")
 
-        # Le serveur ne teste pas -> dummy conf matrix
+        # serveur ne teste pas réellement
         dummy_conf = (1, 0, 0, 0)
         stats.register_program(current_rules, dummy_conf)
 
-        # Si les clients disent (ALL, NONE), on enregistre la solution et on renvoie
+        # Si les clients signalent (ALL, NONE) → enregistrer solution et renvoyer
         if normalized_outcome == (Outcome.ALL, Outcome.NONE):
             stats.register_solution(current_rules, dummy_conf)
             rules_bytes = [Clause.to_code(rule) for rule in current_rules]
             rules_nd = np.array(rules_bytes, dtype="<U1000")
-            return [rules_nd], current_min_clause, current_before, clause_size, solver
+            return [rules_nd], current_min_clause, current_before, clause_size, solver, True
 
-        # Sinon, construire, grounder et ajouter les contraintes
-        with stats.duration('build'):
+        # 4) Sinon: construire/grounder/ajouter contraintes
+        with stats.duration("build"):
             constraints = build_rules(
                 settings=settings,
                 stats=stats,
                 constrainer=constrainer,
-                tester=tester,           # DummyTester côté serveur
+                tester=tester,
                 program=current_rules,
                 before=before,
                 min_clause=min_clause,
@@ -217,24 +218,27 @@ def aggregate_popper(
 
         log.debug(f"🔍 Generated constraints (symbolic): {constraints}")
 
-        with stats.duration('ground'):
+        with stats.duration("ground"):
             grounded = ground_rules(stats, grounder, solver.max_clauses, solver.max_vars, constraints)
 
         log.debug("🔍 Adding grounded constraints to solver")
-        with stats.duration('add'):
+        with stats.duration("add"):
             solver.add_ground_clauses(grounded)
 
-    # 4) Si aucune règle générée (pas de modèle), renvoyer vide
+    # 5) Renvoyer correctement les règles (ou vide)
     if not current_rules:
         empty = np.array([], dtype="<U1000")
         log.info("🚀 Sending 0 rules to clients (no model).")
-        return [empty], current_min_clause, current_before, clause_size, solver
+        # 👇 Correction ici : envelopper dans une liste []
+        return [empty], current_min_clause, current_before, clause_size, solver, False
 
-    # 5) Sinon renvoyer la dernière hypothèse
+    # sinon, envoyer la règle sous forme de tableau de chaînes
     rules_bytes = [Clause.to_code(rule) for rule in current_rules]
     rules_nd = np.array(rules_bytes, dtype="<U1000")
+
     log.info(f"🚀 Sending {len(rules_nd)} rules to clients.")
-    return [rules_nd], current_min_clause, current_before, clause_size, solver
+    # 👇 idem ici : renvoyer [rules_nd] (pas rules_nd seul)
+    return [rules_nd], current_min_clause, current_before, clause_size, solver, False
 
 
 def aggregate_popper_11nov(outcome_list: List[Tuple[int, int]], settings, solver, grounder, constrainer,tester, stats, current_min_clause, current_before, current_hypothesis, clause_size):
