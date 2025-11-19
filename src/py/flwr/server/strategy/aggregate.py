@@ -3,7 +3,7 @@ from flwr.common.logger import log
 from functools import reduce
 from typing import Any, Callable, List, Tuple
 import torch 
-from andante.collections import OrderedSet
+#from andante.collections import OrderedSet
 import numpy as np
 from flwr.common import FitRes, NDArray, NDArrays, parameters_to_ndarrays, ndarray_to_bytes
 from flwr.server.client_proxy import ClientProxy
@@ -36,6 +36,397 @@ import re
 # 🔹 Logging Setup
 logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger(__name__)
+
+# ========================================
+#   Federated Popper (FILP) aggregation
+# ========================================
+
+import numpy as np
+from logging import getLogger
+log = getLogger(__name__)
+
+from popper.loop import (
+    Outcome,
+    build_rules,
+    ground_rules,
+    generate_program,
+)
+
+OUTCOME_ENCODING = {"all": 1, "some": 2, "none": 3}
+OUTCOME_DECODING = {1: "all", 2: "some", 3: "none"}
+
+# FILP aggregation rules
+AGG_EPLUS = {
+    ("all", "all"): "all",
+    ("all", "some"): "some",
+    ("all", "none"): "some",
+    ("some", "some"): "some",
+    ("some", "none"): "some",
+    ("none", "none"): "none",
+}
+
+AGG_EMINUS = {
+    ("some", "some"): "some",
+    ("some", "none"): "some",
+    ("none", "some"): "some",
+    ("none", "none"): "none",
+}
+
+def aggregate_outcomes_FILP(outcomes):
+    """Aggregate outcomes into a global (E+, E-) according to FILP semantics."""
+    
+    if not outcomes:
+        log.warning("⚠ No outcomes received → default NONE,NONE")
+        return ("none", "none")
+
+    eplus, eminus = outcomes[0]
+
+    for ep, en in outcomes[1:]:
+        eplus  = AGG_EPLUS.get((eplus, ep), eplus)
+        eminus = AGG_EMINUS.get((eminus, en), eminus)
+
+    return (eplus, eminus)
+
+
+def aggregate_popper(
+    outcome_list,
+    settings,
+    solver,
+    grounder,
+    constrainer,
+    tester,
+    stats,
+    current_min_clause,
+    current_before,
+    current_hypothesis,
+    clause_size,
+):
+    """FILP Popper — UN step par round, compatibilité totale avec Popper."""
+
+    log.info("===== FILP aggregate_popper =====")
+
+    # ---------------------------------------------------------
+    # 1) Décoder outcomes (int ou string)
+    # ---------------------------------------------------------
+    encoded_pairs = []
+    for (arrs, _) in outcome_list:
+        arr = arrs[0]
+        if arr.dtype.kind in ("i","u"):
+            epos, eneg = int(arr[0]), int(arr[1])
+        else:
+            epos = OUTCOME_ENCODING[str(arr[0]).lower()]
+            eneg = OUTCOME_ENCODING[str(arr[1]).lower()]
+        encoded_pairs.append((epos, eneg))
+
+    # ---------------------------------------------------------
+    # 2) Agrégation globale
+    # ---------------------------------------------------------
+    epos_id, eneg_id = aggregate_outcomes(encoded_pairs)
+    pos_s = OUTCOME_DECODING[epos_id]
+    neg_s = OUTCOME_DECODING[eneg_id]
+
+    # (FILP: pas de ALL en négatif)
+    if neg_s == "all":
+        neg_s = "some"
+
+    normalized_outcome = (
+        Outcome.ALL if pos_s == "all" else Outcome.SOME if pos_s == "some" else Outcome.NONE,
+        Outcome.ALL if neg_s == "all" else Outcome.SOME if neg_s == "some" else Outcome.NONE,
+    )
+
+    # ---------------------------------------------------------
+    # 3) Ajouter contraintes SI on a déjà une hypothèse précédente
+    # ---------------------------------------------------------
+    if current_hypothesis is not None:
+
+        constraints = build_rules(
+            settings=settings,
+            stats=stats,
+            constrainer=constrainer,
+            tester=tester,
+            program=current_hypothesis,   # <-- Clause objects ! PAS strings
+            before=current_before,
+            min_clause=current_min_clause,
+            outcome=normalized_outcome,
+        )
+
+        grounded = ground_rules(stats, grounder, solver.max_clauses, solver.max_vars, constraints)
+        solver.add_ground_clauses(grounded)
+
+    # ---------------------------------------------------------
+    # 4) Générer UN modèle comme dans Popper
+    # ---------------------------------------------------------
+    model = solver.get_model()
+    if not model:
+        empty = np.array([], dtype="<U1000")
+        # augmenter le moment où le solver n'a plus de modèles
+        clause_size += 1
+        solver.update_number_of_literals(clause_size)
+        stats.update_num_literals(clause_size)
+        return [np.array(rules_bytes)], current_min_clause, current_before, clause_size, solver, False, current_rules
+
+    current_rules, before, min_clause = generate_program(model)  
+    # current_rules = [(head, frozenset(body))]  <-- BON TYPE
+
+    # ---------------------------------------------------------
+    # 5) Condition FILP d'arrêt
+    # ---------------------------------------------------------
+    if normalized_outcome == (Outcome.ALL, Outcome.NONE):
+        rules_bytes = [Clause.to_code(r) for r in current_rules]
+        return [np.array(rules_bytes, dtype="<U1000")], min_clause, before, clause_size, solver, True, current_rules
+
+    # ---------------------------------------------------------
+    # 6) Retour standard
+    # (conversion en strings POUR FLOWER SEULEMENT)
+    # ---------------------------------------------------------
+    rules_bytes = [Clause.to_code(r) for r in current_rules]
+    rules_arr = np.array(rules_bytes, dtype="<U1000")
+
+    return [rules_arr], min_clause, before, clause_size, solver, False, current_rules
+
+
+def aggregate_popperZ(
+    outcome_list,
+    settings,
+    solver,
+    grounder,
+    constrainer,
+    tester,
+    stats,
+    current_min_clause,
+    current_before,
+    current_hypothesis,
+    clause_size,
+):
+    """FILP = UN SEUL PAS POPPER PAR ROUND."""
+    
+    log.info("===== FILP aggregate_popper (one step per round) =====")
+
+    # ---------------------------------------------------------
+    # 1) Décoder outcomes
+    # ---------------------------------------------------------
+    decoded = []
+    for arrs, _count in outcome_list:
+        arr = arrs[0]
+        if arr.dtype.kind in ("i","u"):
+            ep, en = OUTCOME_DECODING[int(arr[0])], OUTCOME_DECODING[int(arr[1])]
+        else:
+            ep, en = str(arr[0]).lower(), str(arr[1]).lower()
+        decoded.append((ep,en))
+
+    gl_ep, gl_en = aggregate_outcomes_FILP(decoded)
+    log.info(f"🌍 Global FILP outcome = ({gl_ep},{gl_en})")
+
+    normalized = (
+        Outcome.ALL if gl_ep=="all" else Outcome.SOME if gl_ep=="some" else Outcome.NONE,
+        Outcome.ALL if gl_en=="all" else Outcome.SOME if gl_en=="some" else Outcome.NONE
+    )
+
+    # ---------------------------------------------------------
+    # 2) Si ce n’est PAS le premier round → appliquer contrainte
+    # ---------------------------------------------------------
+    # le premier round se reconnaît parce que current_hypothesis == None
+    if current_hypothesis is not None:
+
+        with stats.duration("build"):
+            constraints = build_rules(
+                settings=settings,
+                stats=stats,
+                constrainer=constrainer,
+                tester=tester,
+                program=current_hypothesis,
+                before=current_before,
+                min_clause=current_min_clause,
+                outcome=normalized,
+            )
+
+        with stats.duration("ground"):
+            grounded = ground_rules(
+                stats=stats,
+                grounder=grounder,
+                max_clauses=solver.max_clauses,
+                max_vars=solver.max_vars,
+                constraints=constraints,
+            )
+
+        solver.add_ground_clauses(grounded)
+        log.info("➕ Added FILP constraint to solver")
+
+    else:
+        log.info("ℹ First round: no constraints applied.")
+
+    # ---------------------------------------------------------
+    # 3) Générer UNE SEULE règle : un modèle
+    # ---------------------------------------------------------
+    with stats.duration("generate"):
+        model = solver.get_model()
+
+    if not model:
+        log.info("⛔ Solver exhausted: no more models")
+        empty = np.array([], dtype="<U1000")
+        return [empty], current_min_clause, current_before, clause_size, solver, False
+
+    # generate_program = EXACTEMENT Popper
+    current_rules, before, min_clause = generate_program(model)
+    log.info(f"🧱 Generated program: {current_rules}")
+
+    # ---------------------------------------------------------
+    # 4) Condition d'arrêt FILP
+    # ---------------------------------------------------------
+    if normalized == (Outcome.ALL, Outcome.NONE):
+        log.info("🎉 Solution reached: (ALL,NONE)")
+        rules_bytes = [Clause.to_code(r) for r in current_rules]
+        return [np.array(rules_bytes, dtype="<U1000")], min_clause, before, clause_size, solver, True
+
+    # ---------------------------------------------------------
+    # 5) Retour juste UNE règle
+    # ---------------------------------------------------------
+    # Ce qui sert aux clients = strings
+    rules_bytes = [Clause.to_code(r) for r in current_rules]
+
+    # Ce qui sert au serveur pour les rounds suivants = objets Popper natifs
+    return (
+        [np.array(rules_bytes, dtype="<U1000")],  # POUR CLIENTS
+        min_clause,
+        before,
+        clause_size,
+        current_rules,   # <-- IMPORTANT : renvoyer la structure Popper native, PAS l’array
+        solver
+    )
+
+
+def aggregate_popperxxxx(
+    outcome_list,          # from clients
+    settings,
+    solver,
+    grounder,
+    constrainer,
+    tester,                # structural-only tester!
+    stats,
+    current_min_clause,
+    current_before,
+    current_hypothesis,
+    clause_size,
+):
+    """
+    FILP-version of Popper's main learning loop.
+
+    The only signal used to guide hypothesis refinement is the aggregated
+    client outcome (ALL/SOME/NONE). The server NEVER tests rules.
+    """
+    log.info("===== Starting FILP aggregate_popper =====")
+
+    # -------------------------------------------------------------
+    # STEP 1 : Decode outcomes from clients
+    # -------------------------------------------------------------
+    decoded = []
+
+    for arrs, _count in outcome_list:
+        arr = arrs[0]     # e.g., array([1,2]) or array(['all','none'])
+
+        # integers
+        if arr.dtype.kind in ("i", "u"):
+            ep_id, en_id = int(arr[0]), int(arr[1])
+            ep = OUTCOME_DECODING[ep_id]
+            en = OUTCOME_DECODING[en_id]
+
+        # strings
+        else:
+            ep = str(arr[0]).lower().strip()
+            en = str(arr[1]).lower().strip()
+
+        decoded.append((ep, en))
+
+    # -------------------------------------------------------------
+    # STEP 2 : Aggregate outcomes globally
+    # -------------------------------------------------------------
+    gl_ep, gl_en = aggregate_outcomes_FILP(decoded)
+    log.info(f"🌐 FILP Aggregated Outcome = ({gl_ep}, {gl_en})")
+
+    # convert to Popper Outcome type
+    normalized = (
+        Outcome.ALL if gl_ep == "all" else Outcome.SOME if gl_ep == "some" else Outcome.NONE,
+        Outcome.ALL if gl_en == "all" else Outcome.SOME if gl_en == "some" else Outcome.NONE,
+    )
+
+    # -------------------------------------------------------------
+    # STEP 3 : Main FILP Loop (Generate → Constrain → Solve)
+    # -------------------------------------------------------------
+    current_rules = []
+
+    while True:
+        # ---------------------------------------------------------
+        # (3a) Try to extract a model from solver
+        # ---------------------------------------------------------
+        with stats.duration("generate"):
+            model = solver.get_model()
+
+            if not model:
+                log.info("⛔ No more models from solver → stopping generation.")
+                break
+
+            # Generate candidate rules
+            current_rules, before, min_clause = generate_program(model)
+
+            current_hypothesis = current_rules
+            current_before = before
+            current_min_clause = min_clause
+
+            log.info(f"🧱 Candidate Hypothesis = {current_rules}")
+
+
+        # ---------------------------------------------------------
+        # (3b) FILP solution condition: if clients say (ALL,NONE)
+        # ---------------------------------------------------------
+        if normalized == (Outcome.ALL, Outcome.NONE):
+            log.info("🎉 FILP SOLUTION FOUND (ALL,NONE)!")
+            rules_bytes = [Clause.to_code(rule) for rule in current_rules]
+            rules_arr = np.array(rules_bytes, dtype="<U1000")
+            return [rules_arr], current_min_clause, current_before, clause_size, solver, True
+
+        
+        # ---------------------------------------------------------
+        # (3c) Build constraints based on OUTCOME ONLY
+        # ---------------------------------------------------------
+        with stats.duration("build"):
+            constraints = build_rules(
+                settings=settings,
+                stats=stats,
+                constrainer=constrainer,
+                tester=tester,          # purely structural tester
+                program=current_rules,
+                before=before,
+                min_clause=min_clause,
+                outcome=normalized,     # <-- key mechanism in FILP
+            )
+
+
+        # ---------------------------------------------------------
+        # (3d) Ground constraints and add to solver
+        # ---------------------------------------------------------
+        with stats.duration("ground"):
+            grounded = ground_rules(stats, grounder, solver.max_clauses, solver.max_vars, constraints)
+
+        solver.add_ground_clauses(grounded)
+
+
+    # -------------------------------------------------------------
+    # STEP 4 : If no rules, return empty
+    # -------------------------------------------------------------
+    if not current_rules:
+        empty = np.array([], dtype="<U1000")
+        log.info("📤 Sending 0 rules to clients (no model).")
+        return [empty], current_min_clause, current_before, clause_size, solver, False
+
+    # otherwise return last rules
+    rules_bytes = [Clause.to_code(rule) for rule in current_rules]
+    rules_arr = np.array(rules_bytes, dtype="<U1000")
+
+    log.info(f"📤 Sending {len(rules_arr)} rules to clients.")
+    return [rules_arr], current_min_clause, current_before, clause_size, solver, False
+
+
+
 
 #OUTCOME_ENCODING = {"ALL": 1, "SOME": 2, "NONE": 3}
 #OUTCOME_DECODING = {1: "ALL", 2: "SOME", 3: "NONE"}
@@ -128,7 +519,7 @@ def aggregate_outcomes(outcomes: List[Tuple[str, str]]) -> Tuple[str, str]:
 
 
 
-def aggregate_popper(
+def aggregate_popper_17nov(
     outcome_list,   # List[Tuple[List[np.ndarray], int]] : ex [([array([3,3])], 6), ...]
     settings,
     solver,
@@ -542,12 +933,12 @@ def encode_hypotheses_for_flower(hypotheses: List[List[str]]) -> List[np.ndarray
         flat_rules.extend(hyp)
         flat_rules.append("### HYP ###")  # Séparateur
     return [np.array(flat_rules, dtype="<U1000")]    
-
+"""
 def aggregate_ilpx(results: List[Tuple[List[np.ndarray], int]]) -> List[np.ndarray]:
-    """
+    s
     Aggregate rules from all clients using OrderedSet union.
     Removes duplicates and keeps order. Logs everything cleanly.
-    """
+    
     aggregated_set = OrderedSet()
 
     log.info("📦 Aggregating rules from clients...")
@@ -578,11 +969,11 @@ def aggregate_ilpx(results: List[Tuple[List[np.ndarray], int]]) -> List[np.ndarr
 
 
 def aggregate_ilp(results: List[Tuple[List[np.ndarray], int]]) -> List[np.ndarray]:
-    """
+    
     Aggregate rules from all clients.
     Each client sends multiple hypotheses, separated by '### HYP ###'.
     We collect all, optionally deduplicate inside each, and return the full list.
-    """
+
     log.info("📦 Aggregating hypotheses from clients...")
 
     all_hypotheses: List[List[str]] = []
@@ -633,6 +1024,7 @@ def aggregate_ilp(results: List[Tuple[List[np.ndarray], int]]) -> List[np.ndarra
         flat_list.append("### HYP ###")
 
     return [np.array(flat_list, dtype="<U1000")]
+""" 
 
 def aggregate(results: List[Tuple[NDArrays, int]]) -> NDArrays:
     """Compute weighted average."""

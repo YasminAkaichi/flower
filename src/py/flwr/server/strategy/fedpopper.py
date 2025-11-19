@@ -13,6 +13,10 @@ from flwr.common import (
     ndarrays_to_parameters,
     parameters_to_ndarrays,
 )
+
+from popper.constrain import Constrain
+from popper.core import Clause, Literal, ConstVar
+from popper.asp import ClingoGrounder, ClingoSolver
 from dataclasses import dataclass
 from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
@@ -22,7 +26,7 @@ from collections import OrderedDict
 from popper.util import Settings
 from popper.tester import Tester
 
-from popper.dummy_tester import DummyTester
+from popper.structural_tester import StructuralTester
 from popper.core import Clause
 from popper.util import Settings, Stats
 from logging import DEBUG
@@ -71,10 +75,11 @@ class FedPopper(Strategy):
         self.current_before = current_before
         self.current_min_clause = current_min_clause
         self.current_clause_size = current_clause_size
-        self.solver = solver
-        self.grounder = grounder
-        self.constrainer = constrainer
-        self.tester = DummyTester()
+        self.solver = solver if solver is not None else ClingoSolver(settings)
+        self.grounder = grounder if grounder is not None else ClingoGrounder()
+        self.constrainer = constrainer if constrainer is not None else Constrain()
+        self.tester = tester if tester is not None else StructuralTester()
+        self.stats : stats if stats is not None else Stats(log_best_programs=settings.info)
         self.seen_prog = seen_prog
         self.stats = stats 
         self.solution_params: Optional[Parameters] = None
@@ -98,40 +103,34 @@ class FedPopper(Strategy):
     def configure_fit(
     self, server_round: int, parameters: Parameters, client_manager: ClientManager
 ) -> List[Tuple[ClientProxy, FitIns]]:
-        """Configure the next round of training."""
 
-        # ✅ EARLY STOPPING CHECK
+        # === EARLY STOPPING ===
         if getattr(self, "early_stop", False):
-            log(DEBUG, f"⏹️ Early stop triggered at round {server_round}: no more fit() calls.")
-            return []   # -> Means no more clients will be trained
+            log(DEBUG, f"⏹️ Early stop triggered at round {server_round}. Ending FL loop.")
+            return []      # ← FLORRRRR arrête ici automatiquement
 
-        # ✅ Normal behavior if not early-stopped
+        # === If not early-stopped → normal sampling ===
         sample_size, min_num_clients = self.num_fit_clients(
             client_manager.num_available()
         )
         clients = client_manager.sample(
             num_clients=sample_size,
-            min_num_clients=min_num_clients
+            min_num_clients=min_num_clients,
         )
 
-        # Your lr-splitting logic
         n_clients = len(clients)
-        half_clients = n_clients // 2
-        standard_config = {"lr": 0.001}
-        higher_lr_config = {"lr": 0.003}
+        half = n_clients // 2
 
-        fit_configurations = []
+        standard_cfg = {"lr": 0.001}
+        high_cfg = {"lr": 0.003}
+
+        fit_cfg = []
         for idx, client in enumerate(clients):
-            if idx < half_clients:
-                fit_configurations.append(
-                    (client, FitIns(parameters, standard_config))
-                )
-            else:
-                fit_configurations.append(
-                    (client, FitIns(parameters, higher_lr_config))
-                )
+            cfg = standard_cfg if idx < half else high_cfg
+            fit_cfg.append((client, FitIns(parameters, cfg)))
 
-        return fit_configurations
+        return fit_cfg
+
 
 
     def aggregate_fit(
@@ -141,99 +140,52 @@ class FedPopper(Strategy):
         failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
     ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
         """Aggregate fit results using the ILP aggregation method."""
-        
-        # ✅ Step 1: Extract outcome pairs (E+, E-) and number of examples
+        # 1) Collect outcomes from clients
         outcome_results = [
-            (parameters_to_ndarrays(fit_res.parameters), fit_res.num_examples)
-            for _, fit_res in results
+            (parameters_to_ndarrays(res.parameters), res.num_examples)
+            for _, res in results
         ]
 
-        log(DEBUG, f"Received encoded outcomes from clients: {outcome_results}")
+        # Decode outcomes
+        encoded = [tuple(arr[0].tolist()) for arr, _ in outcome_results]
+        decoded = [(DECODE[int(a)], DECODE[int(b)]) for (a,b) in encoded]
 
-        # 2) (optionnel) re-calculer l’outcome global (encoded -> str)
+        ep_glob, en_glob = aggregate_outcomes(decoded)
 
-        encoded = [tuple(arr[0].tolist()) for arr, _ in outcome_results]  # p.ex. [(3,3), (1,2)]
-        # sécurité: convertir numpy.int64 -> int -> 'all/some/none'
-        decoded = [(DECODE[int(a)], DECODE[int(b)]) for (a, b) in encoded]
-        eplus_glob, eminus_glob = aggregate_outcomes(decoded)
-
-        # ✅ Step 2: Aggregate outcomes and generate new rules
-        self.current_clause_size += 1
-        self.solver.update_number_of_literals(self.current_clause_size)
-        self.stats.update_num_literals(self.current_clause_size)
-        new_rules, min_clause, before, clause_size, solver, solved = aggregate_popper(
-            outcome_results, 
+        # 2) Step Popper : one iteration of while-loop
+        new_rules, min_clause, before, clause_size, solver, solved, true_rules = aggregate_popper(
+            outcome_results,
             self.settings,
-            self.solver, 
-            self.grounder, 
-            self.constrainer, 
+            self.solver,
+            self.grounder,
+            self.constrainer,
             self.tester,
-            self.stats, 
-            self.current_min_clause, 
-            self.current_before,  
-            self.current_hypothesis,  
-            self.current_clause_size)
-   
-        self.solver.update_number_of_literals(self.current_clause_size)
-        if solved:
+            self.stats,
+            self.current_min_clause,
+            self.current_before,
+            self.current_hypothesis,
+            self.current_clause_size
+        )
+        # 3) Update internal state for next round
+        self.current_min_clause = min_clause
+        self.current_before = before
+        self.current_clause_size = clause_size
+        self.solver = solver
+        #self.early_stop = solved
+        # Keep hypothesis ONLY if not empty
+        if new_rules and len(new_rules[0])>0:
+            #self.current_hypothesis = new_rules
+            self.current_hypothesis = true_rules 
+
+        # 4) Convert rules to Flower-format
+        params = ndarrays_to_parameters(new_rules)
+
+        # 5) Early stop if true solution
+        if (ep_glob, en_glob) == ("all","none"):
+            self.solution_params = params
             self.early_stop = True
-            log(DEBUG, "✅ Early stop activated: global outcome is (ALL, NONE).")
 
-        if new_rules and len(new_rules[0]) > 0:
-            self.current_hypothesis = new_rules
-            self.current_before = before
-            self.current_min_clause = min_clause
-            self.current_clause_size = clause_size
-            #self.stats = updated_stats
-            log(DEBUG,"✅ Updated current hypothesis and constraints for next round.")
-
-        #log(DEBUG, f"Generated hypothesis (new rules) from constraints: {new_rules}")
-        # ✅ If no new rules were generated, keep the previous hypothesis
-        def _ensure_ndarrays(rules):
-            # cas None
-            if rules is None:
-                return [np.array([], dtype="<U1000")]
-            # déjà la bonne forme -> [ndarray, ...]
-            if isinstance(rules, list) and len(rules) > 0 and isinstance(rules[0], np.ndarray):
-                return rules
-            # liste vide
-            if isinstance(rules, list) and len(rules) == 0:
-                return [np.array([], dtype="<U1000")]
-            # liste de strings -> un seul ndarray
-            if isinstance(rules, list) and len(rules) > 0 and isinstance(rules[0], str):
-                return [np.array(rules, dtype="<U1000")]
-            # ndarray seul
-            if isinstance(rules, np.ndarray):
-                # 0-D ou vide -> liste avec ndarray vide
-                if rules.ndim == 0 or rules.size == 0:
-                    return [np.array([], dtype="<U1000")]
-                return [rules]
-            # fallback sûr
-            return [np.array([], dtype="<U1000")]
-
-        # garder l’ancienne hypothèse si rien de nouveau
-        if not new_rules or (isinstance(new_rules, list) and len(new_rules) > 0 and isinstance(new_rules[0], np.ndarray) and len(new_rules[0]) == 0):
-            new_rules = self.current_hypothesis
-
-        new_rules_ndarrays = _ensure_ndarrays(new_rules)
-        parameters_aggregated = ndarrays_to_parameters(new_rules_ndarrays)
-                
-        # ✅ Step 3: Convert rules to Flower parameters
-        #parameters_aggregated = ndarrays_to_parameters(new_rules_ndarray)
-        
-        # ✅ 4) Si l’outcome global est (ALL,NONE), mémoriser ces paramètres comme “règle finale”
-        if (eplus_glob, eminus_glob) == ("all", "none"):
-            self.solution_params = parameters_aggregated  # 🔒 garde la solution pour l’évaluation
-
-        # ✅ Step 4: Aggregate custom metrics if provided
-        metrics_aggregated = {}
-        if self.fit_metrics_aggregation_fn:
-            fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
-            metrics_aggregated = self.fit_metrics_aggregation_fn(fit_metrics)
-        elif server_round == 1:
-            log(WARNING, "No fit_metrics_aggregation_fn provided")
-
-        return parameters_aggregated, metrics_aggregated
+        return params, {}
     
 
     def configure_evaluate(
@@ -244,7 +196,7 @@ class FedPopper(Strategy):
 
         # ✅ EARLY STOP: If the final program was found, we evaluate ONCE then stop.
         if getattr(self, "early_stop", False):
-            log.debug(f"⏹️ Early stop is active at round {server_round}: skipping evaluation.")
+            log(DEBUG,f"⏹️ Early stop is active at round {server_round}: skipping evaluation.")
             return []
 
         if self.fraction_evaluate == 0.0:
